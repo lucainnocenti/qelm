@@ -162,9 +162,6 @@ class QELM:
         QELM
             The instance with computed train_MSE and test_MSE.
         """
-        if self.test_dict is None:
-            raise ValueError('Test data not provided.')
-
         if train:
             if self.train_dict is None:
                 raise ValueError('Train data not provided.')
@@ -172,11 +169,25 @@ class QELM:
             # Compute mean squared error along axis 1
             self.train_MSE: NDArray[np.float64] = np.mean((self.train_predictions - self.train_dict['labels']) ** 2, axis=1)
         if test:
+            if self.test_dict is None:
+                raise ValueError('Test data not provided.')
             self.test_predictions = self.predict(self.test_dict['frequencies'])
             self.test_MSE: NDArray[np.float64] = np.mean((self.test_predictions - self.test_dict['labels']) ** 2, axis=1)
 
         if display_results:
-            display(Markdown(f"***Train MSE***: {self.train_MSE}"))
-            display(Markdown(f"***Test MSE***: {self.test_MSE}"))
+            if train and not test:
+                merged_md = Markdown(
+                    f"***Train MSE***: {self.train_MSE}"
+                )
+            elif not train and test:
+                merged_md = Markdown(
+                    f"***Test MSE***: {self.test_MSE}"
+                )
+            else:
+                # Both train and test MSE are computed
+                merged_md = Markdown(
+                    f"***Train MSE***: {self.train_MSE}\n\n***Test MSE***: {self.test_MSE}"
+                )
+            display(merged_md)
         
         return self

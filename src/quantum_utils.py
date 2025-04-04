@@ -2,11 +2,11 @@ import qutip # type: ignore
 import numpy as np
 import numpy.typing as npt
 import typing
-from typing import List, Union
+from typing import List, Union, Iterable, Optional
 
 def measure_povm(
-        state: Union[qutip.Qobj, List[qutip.Qobj]],
-        povm: list[qutip.Qobj],
+        state: Union[qutip.Qobj, Iterable[qutip.Qobj]],
+        povm: Iterable[qutip.Qobj],
         statistics: Union[int, float],
         return_frequencies: bool = False
     ) -> npt.NDArray:
@@ -27,11 +27,16 @@ def measure_povm(
         If True, return the frequencies instead of the raw outcomes.
         Default is False.
     """
+    # make povm a list if it is not already
+    if not isinstance(povm, list):
+        povm = list(povm)
+
     # Check if the POVM is valid
     if not all(op.isherm for op in povm):
         raise ValueError("All POVM operators must be Hermitian.")
     
-    if isinstance(state, list):
+    if not isinstance(state, qutip.Qobj):
+        state = list(state)
         # if a list of states is provided, we measure each one separately and return a matrix as output
         results = [measure_povm(s, povm, statistics, return_frequencies) for s in state]
         results = np.asarray(results)
@@ -97,3 +102,38 @@ def mub_povm():
         qutip.ket2dm(qutip.basis(2, 0) - 1j * qutip.basis(2, 1)) / 2
     ]
     return [op / 3 for op in ops]
+
+def random_rank1_povm(dim: int, num_outcomes: int, seed: Optional[bool] = None):
+    """
+    Generate a random rank-1 POVM with d outcomes in a d-dimensional Hilbert space.
+    The returned list [E_1, ..., E_d] satisfies sum_i E_i = I_d, 
+    and each E_i is a rank-1 projector.
+    
+    Parameters
+    ----------
+    d : int
+        Dimension of the Hilbert space.
+    num_outcomes : int
+    seed : int, optional
+        Seed for reproducible random generation.
+    
+    Returns
+    -------
+    povm : list of ndarray
+        A list [E_1, ..., E_d] of d rank-1 projectors,
+        each a d x d complex ndarray.
+    """
+
+    if seed is not None:
+        np.random.seed(seed)
+    
+    random_unitary = qutip.rand_unitary(num_outcomes).full()[:, :dim]
+    
+    # Build POVM elements as rank-1 projectors onto the columns of U
+    povm = []
+    for i in range(num_outcomes):
+        col = random_unitary[i]
+        E_i = np.outer(col, col.conjugate())
+        povm.append(qutip.Qobj(E_i))
+    
+    return povm
