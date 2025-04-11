@@ -4,7 +4,8 @@ from IPython.display import Markdown, display
 from numpy.typing import NDArray
 from typing import Optional, TypedDict, List, Any, Union, Dict
 
-from src.utils import truncate_svd, kets_to_vectorized_states_matrix
+from src.utils import truncate_svd
+from src.quantum_utils import kets_to_vectorized_states_matrix
 
 
 class QELM:
@@ -16,7 +17,7 @@ class QELM:
         train_dict: Optional[dict] = None,
         test_dict: Optional[dict] = None,
         method: str = 'standard',
-        train_options: Optional[dict] = None,
+        train_options: Dict[str, Any] = {},
         w: Optional[NDArray] = None
     ) -> None:
         """
@@ -38,13 +39,16 @@ class QELM:
         self.train_dict = train_dict
         self.test_dict = test_dict
         self.method: str = method
-        self.train_options: Dict[str, Any] = train_options or {}
+        self.train_options = train_options
         
         # These will be set during training or prediction.
         self.w = None
         self.train_predictions = None
         self.test_predictions = None
         self.state_shadow = None
+
+        if method not in ['standard']:
+            raise ValueError(f'Currently only "standard" is implemented.')
 
         if w is None:
             self._train_standard(**self.train_options)
@@ -54,7 +58,7 @@ class QELM:
 
     def _train_standard(
         self,
-        truncate_singular_values: Union[bool, int] = False,
+        truncate_singular_values: Optional[int] = None,
         rcond: Optional[Union[float, NDArray[np.float64]]] = None
     ) -> None:
         """
@@ -62,7 +66,7 @@ class QELM:
 
         Parameters
         -----------
-        truncate_singular_values : bool or int
+        truncate_singular_values : int
             Whether to truncate the pseudo-inverse calculation at a finite value.
             Default is False (i.e., no truncation).
         rcond : array_like or float, optional
@@ -72,7 +76,7 @@ class QELM:
             raise ValueError('Train data not provided.')
 
         frequencies = self.train_dict['frequencies']
-        if truncate_singular_values is not False:
+        if truncate_singular_values is not None:
             # Assume truncate_svd returns an NDArray[np.float64]
             frequencies = truncate_svd(frequencies, truncate_singular_values)
 
@@ -117,7 +121,7 @@ class QELM:
             raise ValueError('No states provided in train_dict. Did you use `save_states=True` when creating the dataset?')
         
         # Convert the states (usually stored as kets) to vectorized density matrices.
-        states_matrix = kets_to_vectorized_states_matrix(states, basis='paulis')
+        states_matrix = kets_to_vectorized_states_matrix(states, basis='pauli')
         self.state_shadow = np.dot(states_matrix, np.linalg.pinv(frequencies))
         return self
 
