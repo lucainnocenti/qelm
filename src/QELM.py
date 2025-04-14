@@ -1,12 +1,16 @@
 from __future__ import annotations
+import logging
+logger = logging.getLogger(__name__)
 import numpy as np
+import qutip
 from IPython.display import Markdown, display
 from numpy.typing import NDArray
-from typing import Optional, TypedDict, List, Any, Union, Dict, cast
+from typing import Optional, TypedDict, List, Any, Union, Dict, cast, Sequence, Tuple
 
 from src.utils import truncate_svd
 from src.quantum_utils import kets_to_vectorized_states_matrix
 from src.types import TrainingData
+from src.POVM import POVMType
 
 
 class QELM:
@@ -90,6 +94,98 @@ class QELM:
             np.linalg.pinv(frequencies)
         )
     
+    @classmethod
+    def train_from_observables_and_states(cls,
+        training_states: Sequence[qutip.Qobj],
+        target_observables: Sequence[qutip.Qobj],
+        povm: POVMType,
+        statistics: Union[float, Tuple[float, float]],
+        method: str = 'standard',
+        train_options: Dict[str, Any] = {},
+        test_states: Optional[Sequence[qutip.Qobj]] = None,
+        sampling_method: str = 'standard'
+    ) -> QELM:
+        """
+        Factory method to create and train a QELM directly from input states and observables.
+
+        Handles data generation using TrainingData.from_quantum_inputs and then initializes and trains the QELM instance.
+
+        Parameters
+        ----------
+        training_states : Sequence[qutip.Qobj]
+            Quantum states for the training set.
+        target_observables : Sequence[qutip.Qobj]
+            Observables defining the target labels.
+        povm : POVMType
+            POVM used for measurements.
+        statistics : Union[float, Tuple[float, float]]
+            Measurement statistics.
+            - float: Used for both training and testing (if test_states provided).
+            - Tuple[float, float]: (train_statistics, test_statistics). Requires test_states.
+        method : str, optional
+            Training method for the QELM (default: 'standard').
+        train_options : Dict[str, Any], optional
+            Options passed to the QELM training method.
+        test_states : Optional[Sequence[qutip.Qobj]], optional
+            Quantum states for the test set (default: None).
+        sampling_method : str, optional
+            Method for sampling measurement outcomes ('standard' or 'poisson').
+
+        Returns
+        -------
+        QELM
+            The trained QELM model instance.
+        """
+        # --- Statistics Handling ---
+        if isinstance(statistics, (list, tuple)):
+            if len(statistics) != 2:
+                raise ValueError("If statistics is a list/tuple, it must have two elements (train_stat, test_stat).")
+            if test_states is None:
+                raise ValueError("If separate train/test statistics are given via list/tuple, test_states must be provided.")
+            train_stat, test_stat = statistics
+            logger.info(f"Using separate statistics: Train={train_stat}, Test={test_stat}")
+        else:
+            train_stat = statistics
+            test_stat = statistics # Use same for test if only one value provided
+            logger.info(f"Using single statistics value for train/test: {train_stat}")
+
+        # --- Generate Training Data ---
+        logger.info("Generating training data...")
+        train_data = TrainingData.from_states_and_observables(
+            states=training_states,
+            observables=target_observables,
+            povm=povm,
+            statistics=train_stat,
+            sampling_method=sampling_method
+        )
+
+        # --- Generate Test Data (Optional) ---
+        test_data: Optional[TrainingData] = None
+        if test_states is not None:
+            logger.info("Generating test data...")
+            test_data = TrainingData.from_states_and_observables(
+                states=test_states,
+                observables=target_observables, # Use same observables
+                povm=povm,
+                statistics=test_stat,
+                sampling_method=sampling_method # Usually same method for consistency
+            )
+        
+        # --- Initialize and Train QELM ---
+        logger.info("Initializing QELM instance with generated data.")
+        # Pass generated data and other options to the standard constructor
+        qelm_instance = cls(
+            train=train_data,
+            test=test_data,
+            method=method,
+            train_options=train_options
+            # Pass w=None explicitly, as we want it to train
+        )
+        # The __init__ method now handles calling _train
+
+        return qelm_instance
+
+
     def compute_state_shadow(
         self,
         truncate_singular_values: Union[bool, int] = False
@@ -125,7 +221,8 @@ class QELM:
             frequencies = truncate_svd(frequencies, truncate_singular_values)
 
         
-        # Convert the states (usually stored as kets) to vectorized density matrices.
+        # Convert the states (usually stored as kets) to vectorized density matrices.\
+        raise NotImplementedError("This function needs rethinking.")
         states_matrix = kets_to_vectorized_states_matrix(self.train.states, basis='pauli')
         self.state_shadow = np.dot(states_matrix, np.linalg.pinv(frequencies))
         return self

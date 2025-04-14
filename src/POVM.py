@@ -6,60 +6,77 @@ The class provides methods for initialization, string representation, and iterat
 The main goal is handle labels and qutip.Qobj objects in a consistent manner, mostly for plotting purposes.
 """
 from __future__ import annotations
+import logging
+logger = logging.getLogger(__name__)
+
 from dataclasses import dataclass
-from typing import Sequence, Union, Optional
+from typing import Sequence, Union, Optional, List
 import numpy as np
 from numpy.typing import NDArray
 import qutip
 
 
-
-
-# a dataclass that contains a POVM (as a list of qutip.Qobj) and the associated label, for example, "SIC", "MUB", etc.
-@dataclass
+# class representing POVM (as a list of qutip.Qobj) and the associated label, for example, "SIC", "MUB", etc.
 class POVM:
     """
     Class representing a POVM.
 
-    This class encapsulates a list of POVM elements (qutip.Qobj or numpy.ndarray) and an associated label.
-    It ensures that the POVM elements are a list of qutip.Qobj objects, and provides a default label if none is provided.
+    Accepts various input types for POVM elements (sequences of qutip.Qobj or numpy arrays),
+    but internally converts and stores them as a list of qutip.Qobj objects.
+    It also stores an associated label, useful for plotting or identification purposes.
     
     Attributes:
-        elements (POVMType): A sequence of POVM elements (qutip.Qobj or numpy.ndarray).
-        label (Optional[str]): An optional label for the POVM.
-        num_outcomes (Optional[int]): Number of outcomes. If known, otherwise inferred from the length of the POVM.
+        elements (List[qutip.Qobj]): A list of POVM elements as qutip.Qobj objects.
+        label (str): An optional label for the POVM.
+        num_outcomes (int): Number of outcomes. Inferred from the length of the POVM.
     """
-    elements: POVMType
-    label: Optional[str] = None
-    num_outcomes: Optional[int] = None  # Number of outcomes, if known
+    elements: List[qutip.Qobj]  # The actual stored type
+    label: str
+    num_outcomes: int
     
-    def __post_init__(self):
-        """Process the raw POVM input after initialization."""
+    def __init__(self, elements: POVMType, label: Optional[str] = None):
+        """
+        Initialize a POVM with the given elements.
+
+        Parameters:
+            elements (POVMType): Input POVM elements, which can be:
+                - A sequence of qutip.Qobj objects
+                - A sequence of numpy.ndarray objects (will be converted to qutip.Qobj)
+                - Another POVM object
+            label (Optional[str], optional): A label for the POVM. Defaults to a generated label.
+
+        Note:
+            Although the input can be of various types, after initialization `self.elements` 
+            will always be a list of qutip.Qobj objects.
+        
+        Raises:
+            ValueError: If any element is neither a qutip.Qobj nor a numpy.ndarray.
+        """
         # Generate default label if none provided
-        if self.label is None:
-            self.label = f"unknown, {len(self.elements)} outcomes"
-        if self.num_outcomes is None:
-            self.num_outcomes = len(self.elements)
+        self.num_outcomes = len(elements)
+        if label is None:
+            label = f"unknown, {len(elements)} outcomes"
         
         # Process the POVM elements
         processed_povm = []
-        for op in self.elements:
+        for op in elements:
             if not isinstance(op, (qutip.Qobj, np.ndarray)):
                 raise ValueError("POVM elements must be qutip.Qobj or numpy.ndarray.")
             if isinstance(op, np.ndarray):
                 op = qutip.Qobj(op)
             processed_povm.append(op)
         
-        self.elements = processed_povm  # Replace with processed version
+        self.elements = processed_povm
+        self.label = label
     
-    # make it easier to work with the POVM in a for loop making it seqeuence-like
     def __iter__(self):
         return iter(self.elements)
+    
     def __len__(self):
         return len(self.elements)
+    
     def __getitem__(self, index):
         return self.elements[index]
-
 
 
 # --- Type Definitions ---

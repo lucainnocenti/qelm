@@ -1,5 +1,6 @@
 import itertools
 import logging
+logger = logging.getLogger(__name__)
 
 import qutip
 import numpy as np
@@ -7,7 +8,7 @@ import numpy as np
 # --- Type Hinting Setup ---
 from numpy.typing import NDArray
 import typing
-from typing import List, Union, Iterable, Optional, Literal, Sequence
+from typing import List, Union, Iterable, Optional, Literal, Sequence, cast
 # --- Custom types imports ---
 from src.POVM import POVMType
 
@@ -218,7 +219,7 @@ def ket2dm(ket: NDArray[np.complex128]) -> NDArray[np.complex128]:
     return ket @ ket.conj().T
 
 
-def kets_to_vectorized_states_matrix(list_of_kets: List[NDArray[np.complex128]], basis: BasisType = 'pauli') -> NDArray[np.complex128]:
+def kets_to_vectorized_states_matrix(list_of_kets: Sequence[NDArray[np.complex128]], basis: BasisType = 'pauli') -> NDArray[np.complex128]:
     """
     Convert a list of kets to a vectorized states matrix.
 
@@ -250,66 +251,118 @@ def measure_povm(
     sampling_method: str = 'standard'
 ) -> NDArray:
     """
-    Measure a POVM on a quantum state, or a set of quantum states.
-    Returns the measurement results as a list of integers, each integer representing one outcome of the POVM.
+    Simulates measuring a POVM on one or more quantum states.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     states : Union[qutip.Qobj, Sequence[qutip.Qobj]]
-        The quantum state(s) to be measured.
+        The quantum state(s) (density matrices) to be measured.
     povm : POVMType
-        The POVM to be measured.
-    statistics : int or float
-        The number of measurements to perform.
-        The float is to accept the case of infinite statistics.
-        NOTE: non-integer non-infty floats will be rounded down to the nearest integer.
+        The POVM operators. Can be a sequence of operators or a POVM object.
+    statistics : float
+        Number of measurement shots PER STATE. Use np.inf for exact probabilities.
+        Finite non-integer values will raise an error.
     return_frequencies : bool, optional
-        If True, return the frequencies instead of the raw outcomes.
-        Default is False.
+        - If True: Return measurement frequencies for each state.
+          Shape: (n_states, n_povm_outcomes).
+        - If False (default) and sampling_method='standard': Return raw sampled
+          outcome indices for each state. Shape: (n_states, statistics).
+        - If False and sampling_method='poisson': Raises ValueError.
+    sampling_method : str, optional
+        - 'standard': Sample outcomes using multinomial distribution based on
+          exact probabilities for the requested number of shots (statistics).
+        - 'poisson': Sample counts for each outcome using a Poisson distribution
+          with mean = statistics * probability. Requires return_frequencies=True.
+        (default: 'standard').
+
+    Returns
+    -------
+    NDArray
+        Either the raw measurement outcomes or the outcome frequencies,
+        depending on `return_frequencies` and `sampling_method`. See parameter
+        descriptions for exact shapes.
+
+    Raises
+    ------
+    ValueError
+        If input parameters are invalid (e.g., non-integer finite statistics,
+        requesting raw outcomes with Poisson sampling, unknown sampling method).
+    TypeError
+        If states are not qutip.Qobj objects.
     """
     # ensure povm is properly formatted, if it's not already a POVM object
     if not isinstance(povm, POVM):
         povm = POVM(povm)
+    num_outcomes = len(povm)
     
-    # if multiple states are provided, we measure each one separately
-    if isinstance(states, Sequence):
-        # if a list of states is provided, we measure each one separately and return a matrix as output
-        results = [measure_povm(state, povm, statistics, return_frequencies, sampling_method) for state in states]
-        results = np.asarray(results)
-        return results.T  # returns a matrix of shape (num_outcomes, num_states)
+    # Ensure states is a list
+    if isinstance(states, qutip.Qobj):
+        states = [states]
+    elif not isinstance(states, Sequence):
+         raise TypeError(f"states must be a qutip.Qobj or a Sequence of qutip.Qobj, got {type(states)}.")
+    if not states:
+        raise ValueError("States list cannot be empty.")
+    n_states = len(states)
 
-    # if we're here then `states` is a single state. Check if it's a qutip.Qobj representing a density matrix
-    if not isinstance(states, qutip.Qobj):
-        raise TypeError("Input states must be qutip.Qobj or a sequence of qutip.Qobj.")
-    # convert it to a density matrix if it's not already one
-    if states.type == 'ket':
-        states = qutip.ket2dm(states)
-
-    # compute the output probabilities
-    probabilities = [typing.cast(float, qutip.expect(states, effect)) for effect in povm]
-
-    # Check if statistics is infinity
+    # Check statistics value (return probabilities if np.inf, round non-inf floats)
+    n_shots: int
     if np.isinf(statistics):
-        if return_frequencies:
-            # In the infinite statistics limit, frequencies equal the probabilities
-            return np.array(probabilities)
-        else:
-            raise ValueError("Cannot return raw outcomes for infinite statistics. Please set return_frequencies=True.")
-    # sample from the output probabilities with statistics `statistics`
+        if not return_frequencies:
+             raise ValueError("Cannot return raw outcomes for infinite statistics. Set return_frequencies=True.")
+        n_shots = -1 # Placeholder, won't be used for sampling
+    else:
+        n_shots = round(statistics)  # round down to the nearest integer
+
+    logger.debug(f"Calculating exact probabilities for {n_states} states and {num_outcomes} POVM outcomes.")
+    probabilities = np.array(
+        [qutip.expect(cast(qutip.Qobj, effect), states).real for effect in povm]
+    ).T # shape (n_states, num_outcomes)
+
+    if np.isinf(statistics):
+        logger.debug("Returning exact probabilities for infinite statistics.")
+        return probabilities # Shape (num_outcomes, num_states)
+
+    #### =================== ACTUAL SAMPLING =================== ####
     if sampling_method == 'standard':
-        sampled_outcomes = np.random.choice(a=len(povm), size=round(statistics), p=probabilities)
         if return_frequencies:
-            # return the frequencies of each outcome
-            frequencies = np.bincount(sampled_outcomes, minlength=len(povm)) / statistics
-            return frequencies
-        return sampled_outcomes
+            # Calculate frequencies for each state
+            all_frequencies = np.zeros((num_outcomes, n_states), dtype=float)
+            for i in range(n_states):
+                sampled_outcomes = np.random.choice(
+                    a=num_outcomes, size=n_shots, p=probabilities[i]
+                )
+                # Count occurrences of each outcome
+                counts = np.bincount(sampled_outcomes, minlength=num_outcomes)
+                all_frequencies[:, i] = counts / n_shots
+            return all_frequencies # Shape (num_outcomes, n_states)
+        else:
+            # Return raw sampled outcomes for each state
+            all_sampled_outcomes = np.zeros((n_states, n_shots), dtype=int)
+            for i in range(n_states):
+                all_sampled_outcomes[i, :] = np.random.choice(
+                    a=num_outcomes, size=n_shots, p=probabilities[i]
+                )
+            return all_sampled_outcomes # Shape (n_states, n_shots)
     elif sampling_method == 'poisson':
         if not return_frequencies:
-            raise ValueError("Can only return frequencies when using Poisson sampling.")
-        frequencies = np.random.poisson(lam=round(statistics) * np.asarray(probabilities)) / round(statistics)
-        return frequencies
+            raise ValueError("Cannot return raw outcomes when using Poisson sampling. Set return_frequencies=True.")
+
+        # Calculate expected counts (lambda for Poisson)
+        # Shape: (n_states, num_outcomes)
+        expected_counts = n_shots * probabilities
+
+        # Sample from Poisson distribution
+        # Shape: (n_states, num_outcomes)
+        poisson_counts = np.random.poisson(lam=expected_counts)
+
+        # Calculate frequencies
+        # Avoid division by zero if n_shots is 0 (although handled earlier, defensive check)
+        frequencies = poisson_counts / n_shots
+        return frequencies.T # return shape (num_outcomes, n_states)
+
     else:
-        raise ValueError(f"Unknown sampling method: {sampling_method}. Use 'standard' or 'poisson'.")
+        raise ValueError(f"Unknown sampling method: '{sampling_method}'. Use 'standard' or 'poisson'.")
+
 
 # define a function that returns the single-qubit SIC-POVM
 def sic_povm() -> POVM:
