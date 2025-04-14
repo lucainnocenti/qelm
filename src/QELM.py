@@ -2,10 +2,11 @@ from __future__ import annotations
 import numpy as np
 from IPython.display import Markdown, display
 from numpy.typing import NDArray
-from typing import Optional, TypedDict, List, Any, Union, Dict
+from typing import Optional, TypedDict, List, Any, Union, Dict, cast
 
 from src.utils import truncate_svd
 from src.quantum_utils import kets_to_vectorized_states_matrix
+from src.types import TrainingData
 
 
 class QELM:
@@ -14,8 +15,8 @@ class QELM:
     """
     
     def __init__(self,
-        train_dict: Optional[dict] = None,
-        test_dict: Optional[dict] = None,
+        train: Optional[TrainingData] = None,
+        test: Optional[TrainingData] = None,
         method: str = 'standard',
         train_options: Dict[str, Any] = {},
         w: Optional[NDArray] = None
@@ -25,10 +26,10 @@ class QELM:
 
         Parameters
         -----------
-        train_dict : Optional[dict]
-            Dictionary containing training data.
-        test_dict : Optional[dict]
-            Dictionary containing test data.
+        train : Optional[TrainingData]
+            TrainingData object containing training data.
+        test : Optional[TrainingData]
+            TrainingData object containing test data.
         method : str
             Method to be used for training. Default is 'standard'.
         train_options : dict, optional
@@ -36,8 +37,8 @@ class QELM:
         w : np.ndarray, optional
             Precomputed weight matrix. If provided, training is skipped.
         """
-        self.train_dict = train_dict
-        self.test_dict = test_dict
+        self.train = train
+        self.test = test
         self.method: str = method
         self.train_options = train_options
         
@@ -72,17 +73,20 @@ class QELM:
         rcond : array_like or float, optional
             Parameter passed to numpy.linalg.pinv (currently unused).
         """
-        if self.train_dict is None:
+        if self.train is None:
             raise ValueError('Train data not provided.')
+        if self.train.can_train is False:
+            raise ValueError('Training data is incomplete.')
+        frequencies = cast(NDArray[np.float64], self.train.frequencies)  # frequencies is not None b/c of can_train
+        self.train.labels = cast(NDArray[np.float64], self.train.labels)  # labels is not None b/c of can_train
 
-        frequencies = self.train_dict['frequencies']
         if truncate_singular_values is not None:
             # Assume truncate_svd returns an NDArray[np.float64]
             frequencies = truncate_svd(frequencies, truncate_singular_values)
 
         # Compute weight matrix W using the pseudoinverse of frequencies.
         self.w = np.dot(
-            self.train_dict['labels'],
+            self.train.labels,
             np.linalg.pinv(frequencies)
         )
     
@@ -106,22 +110,23 @@ class QELM:
         QELM
             The instance with computed state shadow stored in self.state_shadow.
         """
-        if self.train_dict is None:
+        if self.train is None:
             raise ValueError('Train data not provided.')
+        if self.train.frequencies is None:
+            raise ValueError('Train frequencies not provided.')
+        if self.train.states is None:
+            raise ValueError('No train states provided. Did you use `save_states=True` when creating the dataset?')
 
-        frequencies = self.train_dict['frequencies']
+        frequencies = self.train.frequencies
         if frequencies.ndim != 2:
             raise ValueError('This should be a 2D array.')
 
         if truncate_singular_values is not False:
             frequencies = truncate_svd(frequencies, truncate_singular_values)
 
-        states = self.train_dict.get('states')
-        if states is None:
-            raise ValueError('No states provided in train_dict. Did you use `save_states=True` when creating the dataset?')
         
         # Convert the states (usually stored as kets) to vectorized density matrices.
-        states_matrix = kets_to_vectorized_states_matrix(states, basis='pauli')
+        states_matrix = kets_to_vectorized_states_matrix(self.train.states, basis='pauli')
         self.state_shadow = np.dot(states_matrix, np.linalg.pinv(frequencies))
         return self
 
@@ -167,16 +172,23 @@ class QELM:
             The instance with computed train_MSE and test_MSE.
         """
         if train:
-            if self.train_dict is None:
-                raise ValueError('Train data not provided.')
-            self.train_predictions = self.predict(self.train_dict['frequencies'])
-            # Compute mean squared error along axis 1
-            self.train_MSE: NDArray[np.float64] = np.mean((self.train_predictions - self.train_dict['labels']) ** 2, axis=1)
+            # Check if train data is provided and can be used to compute MSE
+            if self.train is None or self.train.can_train is False:
+                raise ValueError('Train data not provided or not sufficient.')
+            self.train.frequencies = cast(NDArray[np.float64], self.train.frequencies) # frequencies is not None b/c of can_train
+            self.train.labels = cast(NDArray[np.float64], self.train.labels) # labels is not None b/c of can_train
+            # Compute the train predictions using the trained model
+            self.train_predictions = self.predict(self.train.frequencies)
+            self.train_MSE: NDArray[np.float64] = np.mean((self.train_predictions - self.train.labels) ** 2, axis=1)
         if test:
-            if self.test_dict is None:
-                raise ValueError('Test data not provided.')
-            self.test_predictions = self.predict(self.test_dict['frequencies'])
-            self.test_MSE: NDArray[np.float64] = np.mean((self.test_predictions - self.test_dict['labels']) ** 2, axis=1)
+            # Check if test data is provided and can be used to compute MSE
+            if self.test is None or self.test.can_train is False:
+                raise ValueError('Test data not provided or not sufficient.')
+            self.test.frequencies = cast(NDArray[np.float64], self.test.frequencies) # frequencies is not None b/c of can_train
+            self.test.labels = cast(NDArray[np.float64], self.test.labels) # labels is not None b/c of can_train
+            # Compute the test predictions using the trained model
+            self.test_predictions = self.predict(self.test.frequencies)
+            self.test_MSE: NDArray[np.float64] = np.mean((self.test_predictions - self.test.labels) ** 2, axis=1)
 
         if display_results:
             if train and not test:

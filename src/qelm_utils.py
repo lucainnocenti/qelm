@@ -2,136 +2,218 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import qutip
+from dataclasses import dataclass, field
+import logging # Use logging for potential future info/debug messages
 
-import src.QELM as QELM
-from src.quantum_utils import measure_povm, average_rho, average_rho_tensor_rho
-from src.POVM import POVM
-
+# --- Type Hinting Setup ---
 from numpy.typing import NDArray
-from typing import Optional, Union, Dict, Any, Iterable, List
+from typing import Optional, Union, Dict, Any, Iterable, List, Sequence, Tuple
 
+# --- Custom Imports ---
+from src.QELM import QELM
+from src.quantum_utils import measure_povm, average_rho, average_rho_tensor_rho
+from src.POVM import POVM, POVMType, POVMElement
+# --- Custom types imports ---
+from src.types import TrainingData
 
-def make_train_dict_from_states(
-    training_states: Iterable[qutip.Qobj],
-    target_observables: Iterable[qutip.Qobj],
-    povm: Union[Iterable[qutip.Qobj], POVM],
-    statistics: float
-) -> Dict[str, NDArray[np.float64]]:
+# --- Dataclass Definitions ---
+
+@dataclass
+class EstimatorMetrics:
+    """Holds computed metrics for estimator performance analysis.
+    
+    Attributes
+    ----------
+    variance : List[float]
+        Variance of the estimator.
+    bias2 : List[float]
+        Bias squared of the estimator.
+    mse : List[float]
+        Mean squared error of the estimator.
     """
-    Create a training dictionary from given states and labels.
+    variance: List[float]
+    bias2: List[float]
+    mse: List[float]
+
+@dataclass
+class MetricResults:
+    """Holds the raw results from multiple realizations for different parameter values."""
+    param_values: List[Any] # The values of the parameter being varied (e.g., n_states, statistics)
+    variance_results: Dict[Any, List[float]] = field(default_factory=dict)
+    bias2: Dict[Any, List[float]] = field(default_factory=dict)
+    mse_results: Dict[Any, List[float]] = field(default_factory=dict)
+
+    def add_realization_results(self, param_value: Any, variance: float, bias2: float, mse: float):
+        """Adds results from a single realization."""
+        if param_value not in self.variance_results:
+            self.variance_results[param_value] = []
+            self.bias2[param_value] = []
+            self.mse_results[param_value] = []
+        self.variance_results[param_value].append(variance)
+        self.bias2[param_value].append(bias2)
+        self.mse_results[param_value].append(mse)
+
+# --- Core Functions ---
+
+def make_training_data(
+    training_states: Sequence[qutip.Qobj],
+    target_observables: Sequence[qutip.Qobj],
+    povm: POVMType,
+    statistics: float,
+    sampling_method: str = 'standard'
+) -> TrainingData:
+    """
+    Generates training data (measurement frequencies and target expectation values).
+
+    Measures the provided POVM on each training state to get frequencies and
+    calculates the exact expectation values of target observables for labels.
 
     Parameters
     ----------
-    training_states : np.ndarray
-        Array of quantum states.
-    target_observables : np.ndarray
-        Corresponding labels for the states.
-    povm : np.ndarray
-        POVM operators to be used for measurement.
-    statistics : int or float
-        Number of measurements to perform PER STATE.
-        Meaning the number of samples to be drawn from the POVM, FOR EACH STATE.
-        The float is to accept the case of infinite statistics via np.inf.
-    
-    Returns
-    --------
-    Dict[str, NDArray[np.float64]]
-        Dictionary containing the training data.
-        The keys are 'frequencies' and 'labels'.
-    """
-    # ensure iterables are lists
-    training_states = list(training_states)
-    target_observables = list(target_observables)
+    training_states : Sequence[qutip.Qobj]
+        A sequence of quantum states (density matrices) used for training.
+    target_observables : Sequence[qutip.Qobj]
+        A sequence of observables whose expectation values are the target labels.
+    povm : POVMType
+        The POVM operators used for measurement. Can be a sequence of operators
+        or an instance of the POVM class.
+    statistics : float
+        Number of measurement shots PER STATE. Use np.inf for exact probabilities, otherwise it should be an int.
 
-    # measure the POVM on the training states
-    frequencies = measure_povm(
-        state=training_states,
+    Returns
+    -------
+    TrainingData
+        A dataclass instance containing 'frequencies' and 'labels'.
+        - frequencies: Shape (n_states, n_povm_outcomes)
+        - labels: Shape (n_observables, n_states)
+    """
+    n_states = len(training_states)
+    n_observables = len(target_observables)
+
+    # Input validation (optional but good practice)
+    if n_states == 0:
+        raise ValueError("Training states list cannot be empty.")
+    if n_observables == 0:
+        raise ValueError("Target observables list cannot be empty.")
+    if statistics <= 0:
+        raise ValueError("Statistics must be positive.")
+
+    # Measure the POVM on the training states to get frequencies
+    # this should return shape (n_states, n_outcomes)
+    frequencies: NDArray[np.float64] = measure_povm(
+        states=training_states,
         povm=povm,
         statistics=statistics,
-        return_frequencies=True
+        return_frequencies=True,
+        sampling_method=sampling_method
     )
 
-    train_expvals = np.zeros((len(target_observables), len(training_states)), dtype=np.float64)
+    # Calculate exact expectation values for labels
+    train_expvals = np.zeros((n_observables, n_states), dtype=np.float64)
     for idx, observable in enumerate(target_observables):
+        # Use a list comprehension for conciseness
         expvals = np.array([qutip.expect(observable, state) for state in training_states]).real
         train_expvals[idx] = expvals
 
-    train_dict = {
-        'frequencies': frequencies,
-        'labels': train_expvals
-    }
-
-    return train_dict
+    return TrainingData(frequencies=frequencies, labels=train_expvals)
 
 
-
-def train_qelm_from_states_for_observables(
-    training_states: Iterable[qutip.Qobj],
-    target_observables: Iterable[qutip.Qobj],
-    povm: Union[Iterable[qutip.Qobj], POVM],
-    statistics: Union[float, list[float]],
+def train_qelm_with_observables(
+    training_states: Sequence[qutip.Qobj],
+    target_observables: Sequence[qutip.Qobj],
+    povm: POVMType,
+    statistics: Union[float, Tuple[float, float]],
     method: str = 'standard',
-    train_options: dict = {},
-    test_states: Optional[Iterable[qutip.Qobj]] = None
-) -> QELM.QELM:
+    train_options: Dict[str, Any] = {},
+    test_states: Optional[Sequence[qutip.Qobj]] = None
+) -> QELM:
     """
-    Train a QELM model from given states and labels.
+    Trains a Quantum Extreme Learning Machine (QELM) model.
+
+    Generates training (and optionally testing) data from quantum states,
+    target observables, and POVM measurements, then trains a QELM model.
 
     Parameters
     ----------
-    training_states : np.ndarray
-        Array of quantum states.
-    labels : np.ndarray
-        Corresponding labels for the states.
+    training_states : Sequence[qutip.Qobj]
+        Quantum states for the training set.
+    target_observables : Sequence[qutip.Qobj]
+        Observables defining the target labels for training.
+    povm : POVMType
+        POVM used for measurements.
+    statistics : Union[float, Tuple[float, float]]
+        Measurement statistics.
+        - If float: Used for both training and testing (if test_states provided).
+        - If Tuple[float, float]: Specifies (train_statistics, test_statistics).
+          Requires `test_states` to be provided.
     method : str, optional
-        Method to be used for training. Default is 'standard'.
-    train_options : dict, optional
-        Additional options for training.
-        These are passed to the QELM class.
+        Training method for the QELM model (default: 'standard').
+    train_options : Dict[str, Any], optional
+        Additional options passed directly to the QELM class constructor.
+    test_states : Optional[Sequence[qutip.Qobj]], optional
+        Quantum states for the test set (default: None).
 
     Returns
-    --------
-    QELM.QELM
-        Trained QELM model.
+    -------
+    QELM
+        The trained QELM model instance.
+
+    Raises
+    ------
+    ValueError
+        If `statistics` is a tuple but `test_states` is None, or if the tuple
+        does not contain exactly two elements.
     """
-    # ensure iterables are lists
-    training_states = list(training_states)
-    target_observables = list(target_observables)
-    if test_states is not None:
-        test_states = list(test_states)
-    if isinstance(statistics, list):
-        # if statistics is a list, it must have two elements
+    # Process statistics argument
+    if isinstance(statistics, (list, tuple)):
         if len(statistics) != 2:
-            raise ValueError("If statistics is a list, it must have two elements (for train and for test).")
-        # test states must be provided in this case
+            raise ValueError("If statistics is a list/tuple, it must have two elements (train_stat, test_stat).")
         if test_states is None:
-            raise ValueError("If statistics is a list, test states must be provided.")
-        train_stat = statistics[0]
-        test_stat = statistics[1]
+            raise ValueError("If separate train/test statistics are given via a list/tuple, test_states must be provided.")
+        train_stat, test_stat = statistics
     else:
+        # statistics is a float (or int)
         train_stat = statistics
-        test_stat = statistics
+        test_stat = statistics # Use same for test if applicable
 
-
-    train_dict = make_train_dict_from_states(
+    train_options_local = train_options.copy() # copy to avoid modifying the original
+    sampling_method = train_options_local.pop("sampling_method", "standard") # extract to avoid conflicts with QELM options
+    # Generate training data
+    train_data: TrainingData = make_training_data(
         training_states=training_states,
         target_observables=target_observables,
         povm=povm,
-        statistics=train_stat
+        statistics=train_stat,
+        sampling_method=sampling_method
     )
-    # Initialize and train the QELM model
+
+    # Prepare arguments for QELM constructor
+    # QELM expects dictionaries, so convert TrainingData back if necessary
+    # (Alternatively, modify QELM to accept TrainingData directly)
+    qelm_train_dict = {'frequencies': train_data.frequencies, 'labels': train_data.labels}
+    qelm_test_dict = None
+
+    # Generate test data if provided
+    test_data: Optional[TrainingData]
     if test_states is not None:
-        test_dict = make_train_dict_from_states(
+        test_data = make_training_data(
             training_states=test_states,
             target_observables=target_observables,
             povm=povm,
-            statistics=test_stat
+            statistics=test_stat,
+            sampling_method=sampling_method
         )
-        qelm_model = QELM.QELM(train_dict=train_dict, test_dict=test_dict, method=method,
-                               train_options=train_options)
     else:
-        qelm_model = QELM.QELM(train_dict=train_dict, method=method, train_options=train_options)
-    
+        test_data = None
+
+    # Initialize and train the QELM model
+    qelm_model = QELM(
+        train=train_data,
+        test=test_data, # Will be None if test_states not provided
+        method=method,
+        train_options=train_options_local
+    )
+
     return qelm_model
 
 
@@ -139,424 +221,619 @@ def train_qelm_from_states_for_observables(
 # FUNCTIONS FOR ESTIMATOR ANALYSIS
 # =================================================
 
+def _ensure_numpy_array(op: POVMElement) -> NDArray[np.complex128]:
+    """Helper to convert qutip.Qobj or ndarray to ndarray."""
+    if isinstance(op, qutip.Qobj):
+        return op.full()
+    elif isinstance(op, np.ndarray):
+        return op
+    else:
+        raise TypeError(f"Unsupported operator type: {type(op)}")
 
-def exact_average_estimator_variance(
-    estimator: Iterable[float],
-    povm: Union[Iterable[Union[qutip.Qobj, NDArray]], POVM]
-) -> float:
+def exact_average_estimator_variance(estimator: Sequence[float], povm: POVMType) -> float:
     r"""
-    Computes the *single-shot* variance of the given estimator, averaged over all pure test states.
+    Computes the single-shot estimator variance, averaged over Haar-random pure states.
 
-    This implements the formula
-    Var[\hat o] = E_\rho[\sum-a Tr[\mu_a \rho] \hat o(a)^2 - (\sum_a Tr[\mu_a \rho] \hat o(a))^2]
-    with the average taken over all pure states.
+    Calculates Var[\hat{o}] = E_\rho[ E_a[ \hat{o}(a)^2 | \rho ] - (E_a[ \hat{o}(a) | \rho ])^2 ],
+    where E_\rho denotes the average over pure states sampled uniformly from the
+    Haar measure, E_a[ f(a) | \rho ] = \sum_a Tr[\mu_a \rho] f(a) denotes the expectation
+    value over POVM outcomes 'a' for a fixed state rho, \mu_a are POVM elements,
+    and \hat{o}(a) is the estimator value for outcome 'a'.
 
-    Parameters:
-    estimator (Iterable[float]): The estimator values.
-    povm (Iterable[qutip.Qobj]): The POVM elements.
+    The formula implemented is derived by averaging over rho:
+    Var[\hat o] = \sum_a E_\rho[Tr[\mu_a \rho]] \hat{o}(a)^2
+                 - \sum_{a,b} E_\rho[Tr[\mu_a \rho] Tr[\mu_b \rho]] \hat{o}(a) \hat{o}(b)
+    Using E_\rho[\rho] = I/d and E_\rho[\rho \otimes \rho] = (I \otimes I + S) / (d(d+1)),
+    where S is the swap operator, leading to the implemented trace formulas involving
+    average_rho (I/d) and average_rho_tensor_rho ((I \otimes I + S)/(d(d+1))).
 
-    Returns:
-    float: The variance of the average estimator.
+    Parameters
+    ----------
+    estimator : Sequence[float]
+        The estimator values \hat{o}(a) corresponding to each POVM outcome 'a'.
+    povm : POVMType
+        The POVM elements \mu_a.
+
+    Returns
+    -------
+    float
+        The average single-shot variance of the estimator.
     """
-    # ensure iterables are lists
-    estimator = list(estimator)
-    povm = list(povm)
-    povm_np: List[np.ndarray] = [
-        p.full() if isinstance(p, qutip.Qobj) else p
-        for p in povm
-    ]
+    povm_np: List[NDArray[np.complex128]] = [_ensure_numpy_array(p) for p in povm]
+    estimator_np = np.asarray(estimator, dtype=np.float64) # Ensure numpy array
 
+    if not povm_np:
+        raise ValueError("POVM list cannot be empty.")
+    if len(estimator_np) != len(povm_np):
+         raise ValueError("Estimator length must match the number of POVM elements.")
 
     dim = povm_np[0].shape[0]
     num_outcomes = len(povm_np)
 
-    avg_rho1 = average_rho(d=dim)
-    avg_rho2 = average_rho_tensor_rho(d=dim)
+    # Get the averaged density matrices (assumed pre-computed or computed by these functions)
+    avg_rho1 = average_rho(d=dim) # Proportional to Identity: I / d
+    avg_rho2 = average_rho_tensor_rho(d=dim) # Proportional to (I \otimes I + SWAP) / (d*(d+1))
 
-    # compute first term of the variance
-    # this is the sum over b of Tr[mu_b \rho] o(b)^2, with \rho replaced by its average I/dim
-    term1 = 0
-    for b in range(num_outcomes):
-        term1 += estimator[b]**2 * np.trace(np.dot(povm_np[b], avg_rho1)).real
+    # Term 1: E[ E_a[ o(a)^2 | rho ] ] = Sum_a o(a)^2 * Tr[mu_a * E[rho]]
+    # E[rho] = avg_rho1 = I/d
+    term1 = np.sum([
+        estimator_np[a]**2 * np.trace(np.dot(povm_np[a], avg_rho1)).real
+        for a in range(num_outcomes)
+    ])
 
-    # compute second term of the variance
-    # this is the sum over b of Tr[(mu_a\otimes\mu_b) (\rho\otimes\rho)] o(a) o(b), with \rho\otimes\rho replaced by its average
-    term2 = 0
-    for a in range(num_outcomes):
-        for b in range(num_outcomes):
-            term2 += estimator[a] * estimator[b] * np.trace(np.dot(np.kron(povm_np[a], povm_np[b]), avg_rho2)).real
-    
-    return term1 - term2
+    # Term 2: E[ (E_a[ o(a) | rho ])^2 ] = Sum_{a,b} o(a)o(b) * E[ Tr[mu_a rho] Tr[mu_b rho] ]
+    # E[ Tr[mu_a rho] Tr[mu_b rho] ] = Tr[ (mu_a \otimes mu_b) * E[rho \otimes rho] ]
+    # E[rho \otimes rho] = avg_rho2
+    term2 = np.sum([
+        estimator_np[a] * estimator_np[b] * np.trace(np.kron(povm_np[a], povm_np[b]) @ avg_rho2).real
+        for a in range(num_outcomes)
+        for b in range(num_outcomes)
+    ])
+
+    variance = term1 - term2
+    # Numerical precision can sometimes lead to slightly negative variance
+    # return max(0.0, variance)
+    return variance
+
 
 def exact_average_bias2(
-    estimator: Iterable[float],
-    povm: Union[Iterable[Union[qutip.Qobj, NDArray]], POVM],
-    target_observable: Union[qutip.Qobj, NDArray],
+    estimator: Sequence[float],
+    povm: POVMType,
+    target_observable: POVMElement,
 ) -> float:
     r"""
-    Computes the *single-shot* bias squared, averaged over all pure test states.
+    Computes the single-shot bias squared, averaged over Haar-random pure states.
 
-    This implements the formula
-    Bias[\hat o]^2 = (\sum_a Tr[\mu_a \rho] \hat o(a) - Tr[O \rho])^2
-    with the average taken over all pure states.
+    Calculates Bias[\hat o]^2 = E_\rho[ (E_a[ \hat{o}(a) | \rho ] - Tr[O \rho])^2 ],
+    where E_\rho denotes the average over pure states sampled uniformly from the
+    Haar measure, E_a[ . | \rho ] = \sum_a Tr[\mu_a \rho] . denotes the expectation
+    value over POVM outcomes 'a' for a fixed state rho, \mu_a are POVM elements,
+    \hat{o}(a) is the estimator value for outcome 'a', and O is the target observable.
 
-    Parameters:
-        estimator (Iterable[float]): The estimator values.
-        povm (Iterable[qutip.Qobj]): The POVM elements.
+    The formula implemented is derived by expanding the square and averaging over rho:
+    Bias[\hat o]^2 = E_\rho[ (E_a[ \hat{o}(a) | \rho ])^2 ]
+                    - 2 * E_\rho[ E_a[ \hat{o}(a) | \rho ] * Tr[O \rho] ]
+                    + E_\rho[ (Tr[O \rho])^2 ]
+    This involves terms like E[\rho \otimes \rho], leading to the trace formulas
+    implemented using average_rho_tensor_rho.
 
-    Returns:
-        float: The average bias2 of the estimator.
+    Parameters
+    ----------
+    estimator : Sequence[float]
+        The estimator values \hat{o}(a) corresponding to each POVM outcome 'a'.
+    povm : POVMType
+        The POVM elements \mu_a.
+    target_observable : PovmElement
+        The target observable O.
+
+    Returns
+    -------
+    float
+        The average single-shot bias squared of the estimator.
     """
-    # ensure iterables are lists and all objects are numpy arrays
-    estimator = list(estimator)
-    povm = list(povm)
-    povm_np: List[np.ndarray] = [
-        p.full() if isinstance(p, qutip.Qobj) else p
-        for p in povm
-    ]
-    obs_np = target_observable.full() if isinstance(target_observable, qutip.Qobj) else target_observable
+    povm_np: List[NDArray[np.complex128]] = [_ensure_numpy_array(p) for p in povm]
+    obs_np: NDArray[np.complex128] = _ensure_numpy_array(target_observable)
+    estimator_np = np.asarray(estimator, dtype=np.float64)
+
+    if not povm_np:
+        raise ValueError("POVM list cannot be empty.")
+    if len(estimator_np) != len(povm_np):
+        raise ValueError("Estimator length must match the number of POVM elements.")
+    if obs_np.shape != povm_np[0].shape:
+        raise ValueError("Observable dimensions must match POVM element dimensions.")
+
 
     dim = povm_np[0].shape[0]
     num_outcomes = len(povm_np)
 
-    avg_rho1 = average_rho(d=dim)
-    avg_rho2 = average_rho_tensor_rho(d=dim)
+    # Get the averaged tensor product density matrix
+    # avg_rho1 = average_rho(d=dim) # Not needed here
+    avg_rho2 = average_rho_tensor_rho(d=dim) # Proportional to (I \otimes I + SWAP)/(d*(d+1))
 
-    # compute first term of the variance
-    # this is the sum over b of Tr[mu_b \rho] o(b), with \rho replaced by its average I/dim
-    term1 = 0
-    for a in range(num_outcomes):
-        for b in range(num_outcomes):
-            term1 += estimator[a] * estimator[b] * np.trace(np.dot(np.kron(povm_np[a], povm_np[b]), avg_rho2)).real
+    # Term 1: E[ (E_a[ o(a) | rho ])^2 ] = Sum_{a,b} o(a)o(b) * E[ Tr[mu_a rho] Tr[mu_b rho] ]
+    # E[ Tr[mu_a rho] Tr[mu_b rho] ] = Tr[ (mu_a \otimes mu_b) * E[rho \otimes rho] ]
+    term1 = np.sum([
+        estimator_np[a] * estimator_np[b] * np.trace(np.kron(povm_np[a], povm_np[b]) @ avg_rho2).real
+        for a in range(num_outcomes)
+        for b in range(num_outcomes)
+    ])
 
-    term2 = 0
-    for a in range(num_outcomes):
-        term2 += estimator[a] * np.trace(np.dot(np.kron(povm_np[a], obs_np), avg_rho2)).real
-    
-    term3 = np.trace(np.dot(np.kron(obs_np, obs_np), avg_rho2)).real
-    
-    return term1 - 2 * term2 + term3
+    # Term 2: -2 * E[ E_a[ o(a) | rho ] * Tr[O rho] ] = -2 * Sum_a o(a) E[ Tr[mu_a rho] Tr[O rho] ]
+    # E[ Tr[mu_a rho] Tr[O rho] ] = Tr[ (mu_a \otimes O) * E[rho \otimes rho] ]
+    term2 = -2 * np.sum([
+        estimator_np[a] * np.trace(np.kron(povm_np[a], obs_np) @ avg_rho2).real
+        for a in range(num_outcomes)
+    ])
+
+    # Term 3: E[ (Tr[O rho])^2 ] = E[ Tr[O rho] Tr[O rho] ]
+    # E[ Tr[O rho] Tr[O rho] ] = Tr[ (O \otimes O) * E[rho \otimes rho] ]
+    term3 = np.trace(np.kron(obs_np, obs_np) @ avg_rho2).real
+
+    bias_sq = term1 + term2 + term3
+    # Numerical precision can sometimes lead to slightly negative bias^2
+    # return max(0.0, bias_sq)
+    return bias_sq
 
 
 # =================================================
-# PLOTTING FUNCTIONS
+# PLOTTING FUNCTION
 # =================================================
 
-def biasvar_vs_nstates(
-    povm: POVM,
-    target_observable: Union[qutip.Qobj, NDArray],
-    n_states_list: Iterable[int],
-    n_realizations : int,
-    statistics: float,
-    test_statistics: int = 1,
-    quantiles: List[float] = [0.25, 0.75],
-    fix_total_statistics : bool = True,
-    train_options: Dict[str, Any] = {}
-) -> dict:
-    r"""
-    Computes the bias^2 and variance of the estimator for different numbers of states.
+def _plot_bias_variance_results(
+    results: MetricResults,
+    x_label: str,
+    title: str,
+    quantiles: Tuple[float, float] = (0.25, 0.75),
+    plot_variance: bool = True,
+    plot_bias2: bool = True,
+    plot_mse: bool = True,
+    figsize: Tuple[int, int] = (10, 6)
+) -> None:
+    """
+    Internal helper function to plot bias, variance, and MSE results.
 
-    Produces a plot of computed quantities against the number of states, with median and quantiles computed
-    over multiple realizations.
-    Each realization resamples the training states and the samples from the POVM, but the POVM is fixed beforehand.
+    Creates a log-log plot showing the median and quantile range for
+    variance, bias², and MSE against a varying parameter.
+
+    Parameters
+    ----------
+    results : MetricResults
+        A dataclass containing the parameter values and the computed metrics
+        (variance, bias2, mse) for each realization at each parameter value.
+    x_label : str
+        Label for the x-axis.
+    title : str
+        Title for the plot.
+    quantiles : Tuple[float, float], optional
+        The lower and upper quantiles to display as shaded regions (default: (0.25, 0.75)).
+    plot_variance : bool, optional
+        Whether to plot the variance (default: True).
+    plot_bias2 : bool, optional
+        Whether to plot the bias squared (default: True).
+    plot_mse : bool, optional
+        Whether to plot the MSE (default: True).
+    figsize : Tuple[int, int], optional
+        Figure size (default: (10, 6)).
+    """
+    x_values = results.param_values
+    q_low, q_high = quantiles
+
+    # Compute medians and quantiles for plotting
+    def compute_stats(metric_results_dict):
+        medians = [np.median(metric_results_dict[x]) for x in x_values]
+        lower_q = [np.quantile(metric_results_dict[x], q_low) for x in x_values]
+        upper_q = [np.quantile(metric_results_dict[x], q_high) for x in x_values]
+        return medians, lower_q, upper_q
+
+    median_var, lower_var, upper_var = compute_stats(results.variance_results)
+    median_bias2, lower_bias2, upper_bias2 = compute_stats(results.bias2)
+    median_mse, lower_mse, upper_mse = compute_stats(results.mse_results)
+
+    # Create the plot
+    plt.figure(figsize=figsize)
+
+    quantile_label = f'{q_low*100:.0f}-{q_high*100:.0f}% quantiles'
+
+    # Plot Variance
+    if plot_variance:
+        plt.fill_between(x_values, lower_var, upper_var, color='blue', alpha=0.2, label=f'Variance ({quantile_label})')
+        plt.plot(x_values, median_var, marker='o', linestyle='-', color='blue', label='Median Variance')
+
+    # Plot Bias²
+    if plot_bias2:
+        plt.fill_between(x_values, lower_bias2, upper_bias2, color='green', alpha=0.2, label=f'Bias² ({quantile_label})')
+        plt.plot(x_values, median_bias2, marker='s', linestyle='--', color='green', label='Median Bias²')
+
+    # Plot MSE
+    if plot_mse:
+        plt.fill_between(x_values, lower_mse, upper_mse, color='red', alpha=0.2, label=f'MSE ({quantile_label})')
+        plt.plot(x_values, median_mse, marker='^', linestyle=':', color='red', label='Median MSE')
+
+    # Configure plot appearance
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.xlabel(x_label)
+    # plt.ylabel('Metric Value (log scale)')
+    plt.title(title)
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    plt.legend()
+    plt.tight_layout() # Adjust layout to prevent labels overlapping
+    plt.show()
+
+
+# =================================================
+# BIAS-VARIANCE ANALYSIS FUNCTIONS (using plotter)
+# =================================================
+
+def analyze_biasvar_vs_nstates(
+    povm: POVMType,
+    target_observable: Union[qutip.Qobj, NDArray],
+    n_states_list: Sequence[int],
+    n_realizations: int,
+    train_statistics: float,
+    test_statistics: int = 1,
+    fix_total_statistics: bool = True,
+    quantiles: Tuple[float, float] = (0.25, 0.75),
+    train_options: Dict[str, Any] = {},
+    plot_options: Dict[str, Any] = {'var': True, 'bias2': True, 'mse': True}
+) -> MetricResults:
+    """
+    Analyzes estimator bias² and variance vs. the number of training states.
+
+    For each number of states in `n_states_list`, it performs `n_realizations`.
+    In each realization, new random training states are generated, a QELM model
+    is trained, and its average bias² and variance are computed. The results
+    are aggregated and plotted.
+
+    Parameters
+    ----------
+    povm : POVMType
+        The POVM elements for measurement.
+    target_observable : Union[qutip.Qobj, NDArray]
+        The target observable for estimation.
+    n_states_list : Sequence[int]
+        List of different numbers of training states to evaluate.
+    n_realizations : int
+        Number of independent trials for each number of states.
+    train_statistics : float
+        Total number of measurement shots available for training across all states.
+    test_statistics : float, optional
+        Number of shots assumed for the test phase, used to scale the variance
+        (Var_N = Var_1 / N) (default: 1.0).
+    fix_total_statistics : bool, optional
+        If True (default), `train_statistics` is divided equally among
+        the `n_states` training states (stat_per_state = total / n_states).
+        If False, each state gets `train_statistics` shots.
+    quantiles : Tuple[float, float], optional
+        Quantiles for the shaded region in the plot (default: (0.25, 0.75)).
+    train_options : Dict[str, Any], optional
+        Additional options passed to the QELM training function.
+
+    Returns
+    -------
+    MetricResults
+        A dataclass containing the raw results (variance, bias², mse lists for
+        each n_states value across all realizations).
+    """
+    # Input type handling and validation
+    obs_qobj = qutip.Qobj(target_observable) if not isinstance(target_observable, qutip.Qobj) else target_observable
+    n_states_list = sorted(list(n_states_list)) # Ensure sorted list
+    if not isinstance(povm, POVM):
+        povm = POVM(povm)
+    # Extract state dimension (assuming all POVM elements have same shape)
+    dim = povm.elements[0].shape[0]
+
+    # Initialize results storage
+    results = MetricResults(param_values=n_states_list)
+
+    # Main computation loop
+    for n_states in tqdm(n_states_list, desc='Number of States (n_states)', unit='states'):
+        if n_states <= 0:
+            logging.warning(f"Skipping non-positive n_states value: {n_states}")
+            continue
+
+        # Determine statistics per state for this iteration
+        if fix_total_statistics:
+            # Ensure at least 1 sample per state if possible, avoid division by zero
+            train_stat_per_state = max(1.0, train_statistics / n_states)
+        else:
+            train_stat_per_state = train_statistics # Use the total for each state
+
+        if train_stat_per_state < 1:
+             logging.warning(f"Training statistics per state ({train_stat_per_state:.2f}) is less than 1 for n_states={n_states}. Results may be unreliable.")
+
+
+        for _ in tqdm(range(n_realizations), desc=f'Realizations (n={n_states})', leave=False, unit='realization'):
+            # 1. Sample random training states (using density matrices)
+            # Ensure states are valid density matrices (trace 1, Hermitian, positive semidefinite)
+            # qutip.rand_ket generates normalized kets, ket2dm makes valid rho
+            train_states = [qutip.ket2dm(qutip.rand_ket(dim)) for _ in range(n_states)]
+
+            # 2. Train the QELM model
+            try:
+                qelm = train_qelm_with_observables(
+                    training_states=train_states,
+                    target_observables=[obs_qobj],
+                    povm=povm,
+                    statistics=train_stat_per_state,
+                    train_options=train_options
+                )
+                estimator = qelm.w[0] # type: ignore[assignment]
+            except Exception as e:
+                logging.error(f"QELM training failed for n_states={n_states}: {e}")
+                raise e # Raise the exception to stop execution
+
+            # 3. Compute average bias² and variance for this estimator
+            # Variance is single-shot, scale by test_statistics
+            avg_var_single_shot = exact_average_estimator_variance(estimator=estimator, povm=povm)
+            avg_var = avg_var_single_shot / test_statistics
+
+            avg_bias2 = exact_average_bias2(estimator=estimator, povm=povm, target_observable=obs_qobj)
+            avg_mse = avg_var + avg_bias2
+
+            # 4. Store results
+            results.add_realization_results(n_states, avg_var, avg_bias2, avg_mse)
+
+    # ---- Plotting ----
+    title = (
+        f'Estimator Performance vs. Number of Training States\n'
+        f'Train stat: {train_statistics}, test stat: {test_statistics}, '
+        f'{n_realizations} Realizations/pt, Fixed total stat: {fix_total_statistics}\n'
+        f'POVM: {povm.label}'
+    )
+    _plot_bias_variance_results(
+        results=results,
+        x_label='Number of Training States (log scale)',
+        title=title,
+        quantiles=quantiles,
+        plot_variance=plot_options.get('var', True),
+        plot_bias2=plot_options.get('bias2', True),
+        plot_mse=plot_options.get('mse', True)
+    )
+
+    return results
+
+
+def analyze_biasvar_vs_statistics(
+    povm: POVMType,
+    target_observable: Union[qutip.Qobj, NDArray],
+    train_states: Sequence[qutip.Qobj],
+    train_stats_list: Sequence[int],
+    n_realizations: int,
+    test_statistics: int = 1,
+    divide_stat_per_state: bool = True,
+    quantiles: Tuple[float, float] = (0.25, 0.75),
+    train_options: Dict[str, Any] = {},
+    plot_options: Dict[str, Any] = {'var': True, 'bias2': True, 'mse': True}
+) -> MetricResults:
+    """
+    Analyzes estimator bias² and variance vs. total training statistics.
+
+    Uses a *fixed* set of training states. For each value in `total_stats_list`,
+    it performs `n_realizations`. In each realization, new measurement samples
+    are drawn based on the current statistics budget (divided equally among the
+    fixed training states), a QELM model is trained, and its average bias²
+    and variance are computed. Results are aggregated and plotted.
+
+    Parameters
+    ----------
+    povm : POVMType
+        The POVM elements for measurement.
+    train_states : Sequence[qutip.Qobj]
+        The *fixed* set of quantum states used for training in all realizations.
+    target_observable : Union[qutip.Qobj, NDArray]
+        The target observable for estimation.
+    train_stats_list : Sequence[int]
+        List of different total training statistics budgets to evaluate.
+        This budget is divided equally among the `train_states`, iff divide_stat_per_state is True.
+    n_realizations : int
+        Number of independent trials (resampling measurement outcomes) for each
+        statistics budget.
+    test_statistics : int, optional
+        Number of shots assumed for the test phase, used to scale the variance
+        (Var_N = Var_1 / N) (default: 1).
+    divide_stat_per_state : bool, optional
+        If True (default), `train_statistics` is divided equally among
+        the `train_states` training states (stat_per_state = train_stats / n_states).
+        If False, each state gets `train_statistics` shots (stat_per_state = train_stats).
+    quantiles : Tuple[float, float], optional
+        Quantiles for the shaded region in the plot (default: (0.25, 0.75)).
+    train_options : Dict[str, Any], optional
+        Additional options passed to the QELM training function.
+
+    Returns
+    -------
+    MetricResults
+        A dataclass containing the raw results (variance, bias², mse lists for
+        each total_stats value across all realizations).
+    """
+    # Input type handling and validation
+    obs_qobj = qutip.Qobj(target_observable) if not isinstance(target_observable, qutip.Qobj) else target_observable
+    train_stats_list = sorted(list(train_stats_list)) # Ensure sorted list
+    train_states_list = list(train_states) # Ensure list
+    n_train_states = len(train_states_list)
+    if n_train_states == 0:
+        raise ValueError("train_states list cannot be empty.")
     
-    Args:
-        povm (Iterable[Union[qutip.Qobj, NDArray]]): The POVM elements.
-        target_observable (Union[qutip.Qobj, NDArray]): The target observable.
-        n_states_list (Iterable[int]): List of numbers of states to test.
-        n_realizations (int): Number of realizations to average over.
-        quantiles (Iterable[float]): Quantiles to compute when plotting results.
-        statistics (int): Total TRAINING statistics.
-        fix_total_statistics (bool): If True, the total statistics is fixed and the number of samples per state is adjusted accordingly. If False, each training state uses the provided statistics regardless of n_states.
+    if not isinstance(povm, POVM):
+        povm = POVM(povm)
 
-    Returns:
-        A dictionary containing the computed bias^2, variance, and MSE for each number of states.
-    """
-    # ensure iterables are lists and all objects are qutip objects
-    obs = qutip.Qobj(target_observable) if not isinstance(target_observable, qutip.Qobj) else target_observable
-    n_states_list = list(n_states_list)
-    # extract state dimension
-    dim = povm[0].shape[0]
+    # Initialize results storage
+    results = MetricResults(param_values=train_stats_list)
 
-    var_results = {}
-    bias2_results = {}
-    mse_results = {}
+    # Main computation loop
+    for train_stat in tqdm(train_stats_list, desc='Total Training Statistics', unit='shots'):
+        # Statistics per state for this iteration
+        # NOTE: we are rounding train_stat / n_train_states here. This might lead to slightly misleading plots, be careful
+        train_stat_per_state = round(train_stat / n_train_states) if divide_stat_per_state else train_stat
 
-    # ---- compute the bias and variance for each number of states ----
-    for n_states in tqdm(n_states_list, desc='n_states loop'):
-        var_for_states = []
-        bias2_for_states = []
-        mse_for_states = []
-
-        for _ in tqdm(range(n_realizations), desc='Realization loop', leave=False):
-            # sample random training states
-            train_states = [qutip.ket2dm(qutip.rand_ket(dim, 1)) for _ in range(n_states)]
-            # compute traing statistics, dividing by the number of states if so required
-            if fix_total_statistics:
-                train_stat = statistics / n_states
-            else:
-                train_stat = statistics
-            # train the qelm
-            qelm = train_qelm_from_states_for_observables(
-                training_states=train_states,
-                target_observables=[obs],
-                povm=povm,
-                statistics=train_stat,
-                train_options=train_options
-            )
-            if qelm.w is None:
-                raise ValueError('Model is not trained, or some fuckery is going on (`w` is not set).')
-            estimator = qelm.w[0]
-
-            bias2 = exact_average_bias2(estimator=estimator, povm=povm, target_observable=obs)
-            var = exact_average_estimator_variance(estimator=estimator, povm=povm)
-            # the given test statistics is only used to divide the variance
-            var = var / test_statistics
-            # build the list of results for this specific n_states
-            var_for_states.append(var)
-            bias2_for_states.append(bias2)
-            mse_for_states.append(var + bias2)
-        # build the dictionaries containing all computed results
-        var_results[n_states] = var_for_states
-        bias2_results[n_states] = bias2_for_states
-        mse_results[n_states] = mse_for_states
-    # ---- compute the stuff for the plots ----
-
-    # compute the median and quantiles for each number of states
-    median_var = [np.median(var_results[n_states]) for n_states in n_states_list]
-    lower_var = [np.quantile(var_results[n_states], quantiles[0]) for n_states in n_states_list]
-    upper_var = [np.quantile(var_results[n_states], quantiles[1]) for n_states in n_states_list]
-
-    median_bias2 = [np.median(bias2_results[n_states]) for n_states in n_states_list]
-    lower_bias2 = [np.quantile(bias2_results[n_states], quantiles[0]) for n_states in n_states_list]
-    upper_bias2 = [np.quantile(bias2_results[n_states], quantiles[1]) for n_states in n_states_list]
-
-    median_mse = [np.median(mse_results[n_states]) for n_states in n_states_list]
-    lower_mse = [np.quantile(mse_results[n_states], quantiles[0]) for n_states in n_states_list]
-    upper_mse = [np.quantile(mse_results[n_states], quantiles[1]) for n_states in n_states_list]
-
-    # ---- plot the results ----
-    plt.figure(figsize=(10, 6))
+        if train_stat_per_state < 1:
+             logging.warning(f"Training statistics per state ({train_stat_per_state:.2f}) is less than 1 for total_stat={train_stat}. Results may be unreliable.")
 
 
-    # Plot Variance with quantile error shading
-    plt.fill_between(n_states_list, lower_var, upper_var, color='blue', alpha=0.3, label='Variance {}-{} quantiles'.format(quantiles[0], quantiles[1]))
-    plt.plot(n_states_list, median_var, marker='o', color='blue', label='Median variance')
+        for _ in tqdm(range(n_realizations), desc=f'Realizations (Stat={train_stat:.1e})', leave=False, unit='realization'):
+            # 1. Train the QELM model (states fixed, only measurements resampled)
+            try:
+                qelm = train_qelm_with_observables(
+                    training_states=train_states_list, # Fixed states
+                    target_observables=[obs_qobj],
+                    povm=povm,
+                    statistics=train_stat_per_state, # Calculated stat per state
+                    train_options=train_options
+                )
+                estimator = qelm.w[0] # type: ignore[assignment]
+            except Exception as e:
+                logging.error(f"QELM training failed for total_stat={train_stat}: {e}")
+                raise e # Raise the exception to stop execution            
 
-    # Plot Bias² with quantile error shading
-    plt.fill_between(n_states_list, lower_bias2, upper_bias2, color='green', alpha=0.3, label='Bias² {}-{} quantiles'.format(quantiles[0], quantiles[1]))
-    plt.plot(n_states_list, median_bias2, marker='o', color='green', label='Median bias²')
+            # 2. Compute average bias² and variance for this estimator
+            avg_var_single_shot = exact_average_estimator_variance(estimator=estimator, povm=povm)
+            avg_var = avg_var_single_shot / test_statistics
 
-    # Plot MSE with quantile error shading
-    plt.fill_between(n_states_list, lower_mse, upper_mse, color='red', alpha=0.3, label='MSE {}-{} quantiles'.format(quantiles[0], quantiles[1]))
-    plt.plot(n_states_list, median_mse, marker='o', color='red', label='Median MSE')
+            avg_bias2 = exact_average_bias2(estimator=estimator, povm=povm, target_observable=obs_qobj)
+            avg_mse = avg_var + avg_bias2
 
-    plt.xscale('log')
-    plt.yscale('log')
-    plt.xlabel('Number of training states')
-    # plt.ylabel('Metric Value')
-    plt.title('MSE, Var, Bias² vs number of training states\nTotal training statistics: {}; {} realizations; POVM: {}'.format(statistics, n_realizations, str(povm)))
-    plt.grid(True)
-    plt.legend()
-    plt.show()
+            # 3. Store results
+            results.add_realization_results(train_stat, avg_var, avg_bias2, avg_mse)
 
-    return {'var': var_results, 'bias2': bias2_results, 'mse': mse_results}
+    # ---- Plotting ----
+    title = (
+        f'Estimator Performance vs. Total Training Statistics\n'
+        f'Num Train States: {n_train_states} (fixed), Test Stat: {test_statistics}, '
+        f'{n_realizations} Realizations/pt\n'
+        f'POVM: {povm.label}'
+    )
+    _plot_bias_variance_results(
+        results=results,
+        x_label='Total Training Statistics (log scale)',
+        title=title,
+        quantiles=quantiles,
+        plot_variance=plot_options.get('var', True),
+        plot_bias2=plot_options.get('bias2', True),
+        plot_mse=plot_options.get('mse', True)
+    )
 
-
-def biasvar_vs_statistics(
-    povm: POVM,
-    train_states: Iterable[qutip.Qobj],
-    target_observable: Union[qutip.Qobj, NDArray],
-    stats_list: Iterable[float],
-    n_realizations : int,
-    test_statistics: int = 1,
-    quantiles: List[float] = [0.25, 0.75],
-    train_options: Dict[str, Any] = {}
-) -> dict:
-    r"""
-    Computes the bias^2 and variance of the estimator for different numbers of states.
-
-    Produces a plot of computed quantities against the number of states, with median and quantiles computed
-    over multiple realizations.
-    Each realization resamples from the POVM. POVM and training states are fixed beforehand.
-    
-    Args:
-        povm (Iterable[Union[qutip.Qobj, NDArray]]): The POVM elements.
-        target_observable (Union[qutip.Qobj, NDArray]): The target observable.
-        train_states (Iterable[qutip.Qobj]): The training states.
-        stats_list (Iterable[float]): List of statistics to test.
-        n_realizations (int): Number of realizations to average over.
-        test_statistics (int): Total TEST statistics. This is used to divide the variance.
-        quantiles (Iterable[float]): Quantiles to compute when plotting results.
-
-    Returns:
-        A dictionary containing the computed bias^2, variance, and MSE for each number of states.
-    """
-    # ensure iterables are lists and all objects are qutip objects
-    obs = qutip.Qobj(target_observable) if not isinstance(target_observable, qutip.Qobj) else target_observable
-    stats_list = list(stats_list)
-    train_states_list = list(train_states)
-    # extract state dimension
-    var_results = {}
-    bias2_results = {}
-    mse_results = {}
-    for stat in tqdm(stats_list, desc="Total Statistics"):
-        var_for_states = []
-        bias2_for_states = []
-        mse_for_states = []
-        # print(round(stat / len(train_states)))
-        for _ in tqdm(range(n_realizations), desc="Realizations", leave=False):
-            qelm = train_qelm_from_states_for_observables(
-                training_states=train_states_list,
-                target_observables=[obs],
-                povm=povm,
-                statistics=stat // len(train_states_list),
-                train_options=train_options
-            )
-            if qelm.w is None:
-                raise ValueError('Model is not trained, or some fuckery is going on (`w` is not set).')
-            estimator = qelm.w[0]
-
-            var = exact_average_estimator_variance(estimator=estimator, povm=povm) / test_statistics
-            var_for_states.append(var)
-
-            bias2 = exact_average_bias2(estimator=estimator, povm=povm, target_observable=obs)
-            bias2_for_states.append(bias2)
-
-            mse_for_states.append(var + bias2)
-
-        var_results[stat] = var_for_states
-        bias2_results[stat] = bias2_for_states
-        mse_results[stat] = mse_for_states
-
-    # compute the median and quantiles for each number of states
-    median_var = [np.median(var_results[stat]) for stat in stats_list]
-    lower_var = [np.quantile(var_results[stat], quantiles[0]) for stat in stats_list]
-    upper_var = [np.quantile(var_results[stat], quantiles[1]) for stat in stats_list]
-
-    median_bias2 = [np.median(bias2_results[stat]) for stat in stats_list]
-    lower_bias2 = [np.quantile(bias2_results[stat], quantiles[0]) for stat in stats_list]
-    upper_bias2 = [np.quantile(bias2_results[stat], quantiles[1]) for stat in stats_list]
-
-    median_mse = [np.median(mse_results[stat]) for stat in stats_list]
-    lower_mse = [np.quantile(mse_results[stat], quantiles[0]) for stat in stats_list]
-    upper_mse = [np.quantile(mse_results[stat], quantiles[1]) for stat in stats_list]
-
-    # ---- plot the results ----
-    plt.figure(figsize=(10, 6))
+    return results
 
 
-    # Plot Variance with quantile error shading
-    plt.fill_between(stats_list, lower_var, upper_var, color='blue', alpha=0.3, label='Variance {}-{} quantiles'.format(quantiles[0], quantiles[1]))
-    plt.plot(stats_list, median_var, marker='o', color='blue', label='Median variance')
+# def analyze_biasvar_vs_nstates_fixedstatperstate(
+#     povm: POVMType,
+#     target_observable: POVMElement,
+#     n_states_list: Sequence[int],
+#     stat_per_state: float,
+#     n_realizations: int,
+#     test_statistics: float = 1.0,
+#     quantiles: Tuple[float, float] = (0.25, 0.75),
+#     train_options: Dict[str, Any] = {}
+# ) -> MetricResults:
+#     """
+#     Analyzes estimator bias² and variance vs. number of training states,
+#     using a *fixed* number of measurement shots *per state*.
 
-    # Plot Bias² with quantile error shading
-    plt.fill_between(stats_list, lower_bias2, upper_bias2, color='green', alpha=0.3, label='Bias² {}-{} quantiles'.format(quantiles[0], quantiles[1]))
-    plt.plot(stats_list, median_bias2, marker='o', color='green', label='Median bias²')
+#     This is similar to `analyze_biasvar_vs_nstates`, but instead of fixing the
+#     *total* statistics budget, it fixes the budget allocated to *each*
+#     training state. The total number of shots therefore scales linearly with
+#     the number of training states.
 
-    # Plot MSE with quantile error shading
-    plt.fill_between(stats_list, lower_mse, upper_mse, color='red', alpha=0.3, label='MSE {}-{} quantiles'.format(quantiles[0], quantiles[1]))
-    plt.plot(stats_list, median_mse, marker='o', color='red', label='Median MSE')
+#     Parameters
+#     ----------
+#     povm : POVMType
+#         The POVM elements for measurement.
+#     target_observable : PovmElement
+#         The target observable for estimation.
+#     n_states_list : Sequence[int]
+#         List of different numbers of training states to evaluate.
+#     stat_per_state : float
+#         The *fixed* number of measurement shots used for *each* training state. Must be >= 1.
+#     n_realizations : int
+#         Number of independent trials for each number of states.
+#     test_statistics : float, optional
+#         Number of shots assumed for the test phase, used to scale the variance
+#         (Var_N = Var_1 / N) (default: 1.0).
+#     quantiles : Tuple[float, float], optional
+#         Quantiles for the shaded region in the plot (default: (0.25, 0.75)).
+#     train_options : Dict[str, Any], optional
+#         Additional options passed to the QELM training function.
 
-    plt.xscale('log')
-    plt.yscale('log')
-    plt.xlabel('Total statistics')
-    # plt.ylabel('Metric Value')
-    plt.title('MSE, Var, bias² vs total stat\nnum_train_states: {}; num_realizations: {}; POVM: {}'.format(
-        len(train_states_list), n_realizations, str(povm)))
-    plt.grid(True)
-    plt.legend()
-    plt.show()
+#     Returns
+#     -------
+#     MetricResults
+#         A dataclass containing the raw results (variance, bias², mse lists for
+#         each n_states value across all realizations).
+#     """
+#     # Input type handling and validation
+#     if stat_per_state < 1:
+#         raise ValueError("stat_per_state must be >= 1.")
+#     obs_qobj = qutip.Qobj(target_observable) if not isinstance(target_observable, qutip.Qobj) else target_observable
+#     n_states_list = sorted(list(n_states_list))
 
-    return {'var': var_results, 'bias2': bias2_results, 'mse': mse_results}
+#     # Extract state dimension
+#     if isinstance(povm, POVM):
+#         dim = povm.elements[0].shape[0]
+#     elif povm:
+#         dim = povm[0].shape[0]
+#     else:
+#         raise ValueError("POVM cannot be empty.")
 
+#     # Initialize results storage
+#     results = MetricResults(param_values=n_states_list)
 
-def biasvar_vs_nstates_fixedstatperstate(
-    povm: POVM,
-    target_observable: Union[qutip.Qobj, NDArray],
-    nstates_list: Iterable[int],
-    stat_per_state: int,
-    n_realizations : int,
-    test_statistics: int = 1,
-    quantiles: List[float] = [0.25, 0.75],
-    train_options: Dict[str, Any] = {}
-) -> dict:
-    r"""
-    """
-    # ensure iterables are lists and all objects are qutip objects
-    obs = qutip.Qobj(target_observable) if not isinstance(target_observable, qutip.Qobj) else target_observable
-    nstates_list = list(nstates_list)
-    # extract state dimension
-    var_results = {}
-    bias2_results = {}
-    mse_results = {}
-    for nstates in tqdm(nstates_list, desc="Total Statistics"):
-        var_for_states = []
-        bias2_for_states = []
-        mse_for_states = []
-        # print(round(stat / len(train_states)))
-        for _ in tqdm(range(n_realizations), desc="Realizations", leave=False):
-            train_states = [qutip.ket2dm(qutip.rand_ket(2, 1)) for _ in range(nstates)]
-            qelm = train_qelm_from_states_for_observables(
-                training_states=train_states,
-                target_observables=[obs],
-                povm=povm,
-                statistics=stat_per_state,
-                train_options=train_options
-            )
-            if qelm.w is None:
-                raise ValueError('Model is not trained, or some fuckery is going on (`w` is not set).')
-            estimator = qelm.w[0]
+#     # Main computation loop (essentially identical to analyze_biasvar_vs_nstates,
+#     # but using `stat_per_state` directly instead of calculating it)
+#     for n_states in tqdm(n_states_list, desc='Number of States (n_states)', unit='states'):
+#         if n_states <= 0:
+#             logging.warning(f"Skipping non-positive n_states value: {n_states}")
+#             continue
 
-            var = exact_average_estimator_variance(estimator=estimator, povm=povm) / test_statistics
-            var_for_states.append(var)
+#         # stat_per_state is fixed by the function argument
 
-            bias2 = exact_average_bias2(estimator=estimator, povm=povm, target_observable=obs)
-            bias2_for_states.append(bias2)
+#         for _ in tqdm(range(n_realizations), desc=f'Realizations (n={n_states})', leave=False, unit='realization'):
+#             # 1. Sample random training states
+#             train_states = [qutip.ket2dm(qutip.rand_ket(dim)) for _ in range(n_states)]
 
-            mse_for_states.append(var + bias2)
+#             # 2. Train the QELM model
+#             try:
+#                 qelm = train_qelm_with_observables(
+#                     training_states=train_states,
+#                     target_observables=[obs_qobj],
+#                     povm=povm,
+#                     statistics=stat_per_state, # Use the fixed stat_per_state
+#                     train_options=train_options
+#                 )
+#             except Exception as e:
+#                 logging.error(f"QELM training failed for n_states={n_states}: {e}")
+#                 continue
 
-        var_results[nstates] = var_for_states
-        bias2_results[nstates] = bias2_for_states
-        mse_results[nstates] = mse_for_states
+#             if not hasattr(qelm, 'w') or qelm.w is None or len(qelm.w) == 0:
+#                 logging.error(f"QELM training did not produce weights 'w' for n_states={n_states}.")
+#                 continue
 
-    # compute the median and quantiles for each number of states
-    median_var = [np.median(var_results[stat]) for stat in nstates_list]
-    lower_var = [np.quantile(var_results[stat], quantiles[0]) for stat in nstates_list]
-    upper_var = [np.quantile(var_results[stat], quantiles[1]) for stat in nstates_list]
+#             estimator = qelm.w[0]
 
-    median_bias2 = [np.median(bias2_results[stat]) for stat in nstates_list]
-    lower_bias2 = [np.quantile(bias2_results[stat], quantiles[0]) for stat in nstates_list]
-    upper_bias2 = [np.quantile(bias2_results[stat], quantiles[1]) for stat in nstates_list]
+#             # 3. Compute average bias² and variance
+#             avg_var_single_shot = exact_average_estimator_variance(estimator=estimator, povm=povm)
+#             avg_var = avg_var_single_shot / test_statistics if test_statistics > 0 else np.inf
 
-    median_mse = [np.median(mse_results[stat]) for stat in nstates_list]
-    lower_mse = [np.quantile(mse_results[stat], quantiles[0]) for stat in nstates_list]
-    upper_mse = [np.quantile(mse_results[stat], quantiles[1]) for stat in nstates_list]
+#             avg_bias2 = exact_average_bias2(estimator=estimator, povm=povm, target_observable=obs_qobj)
+#             avg_mse = avg_var + avg_bias2
 
-    # ---- plot the results ----
-    plt.figure(figsize=(10, 6))
+#             # 4. Store results
+#             results.add_realization_results(n_states, avg_var, avg_bias2, avg_mse)
 
+#     # ---- Plotting ----
+#     povm_str = str(povm) if len(str(povm)) < 50 else type(povm).__name__
+#     title = (
+#         f'Estimator Performance vs. Number of Training States\n'
+#         f'Fixed Stat/State: {stat_per_state}, Test Stat: {test_statistics}, '
+#         f'{n_realizations} Realizations/pt\n'
+#         f'POVM: {povm_str}'
+#     )
+#     # Note: X-axis label changed slightly for clarity
+#     _plot_bias_variance_results(
+#         results=results,
+#         x_label='Number of Training States (Fixed Stat/State) (log scale)',
+#         title=title,
+#         quantiles=quantiles
+#     )
 
-    # Plot Variance with quantile error shading
-    plt.fill_between(nstates_list, lower_var, upper_var, color='blue', alpha=0.3, label='Variance {}-{} quantiles'.format(quantiles[0], quantiles[1]))
-    plt.plot(nstates_list, median_var, marker='o', color='blue', label='Median variance')
-
-    # Plot Bias² with quantile error shading
-    plt.fill_between(nstates_list, lower_bias2, upper_bias2, color='green', alpha=0.3, label='Bias² {}-{} quantiles'.format(quantiles[0], quantiles[1]))
-    plt.plot(nstates_list, median_bias2, marker='o', color='green', label='Median bias²')
-
-    # Plot MSE with quantile error shading
-    plt.fill_between(nstates_list, lower_mse, upper_mse, color='red', alpha=0.3, label='MSE {}-{} quantiles'.format(quantiles[0], quantiles[1]))
-    plt.plot(nstates_list, median_mse, marker='o', color='red', label='Median MSE')
-
-    plt.xscale('log')
-    plt.yscale('log')
-    plt.xlabel('Total statistics')
-    # plt.ylabel('Metric Value')
-    plt.title('MSE, Var, bias² vs total stat\nnum_realizations: {}; POVM: {}'.format(
-        n_realizations, str(povm)))
-    plt.grid(True)
-    plt.legend()
-    plt.show()
-
-    return {'var': var_results, 'bias2': bias2_results, 'mse': mse_results}
+#     return results

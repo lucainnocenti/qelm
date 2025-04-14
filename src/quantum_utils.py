@@ -1,12 +1,17 @@
 import itertools
+import logging
 
 import qutip
 import numpy as np
 
+# --- Type Hinting Setup ---
 from numpy.typing import NDArray
 import typing
-from typing import List, Union, Iterable, Optional, Literal
+from typing import List, Union, Iterable, Optional, Literal, Sequence
+# --- Custom types imports ---
+from src.POVM import POVMType
 
+# --- Custom imports ---
 from src.POVM import POVM
 
 # Define Type Aliases for clarity
@@ -14,7 +19,7 @@ MatrixInput = Union[qutip.Qobj, np.ndarray]
 MatrixListInput = Union[MatrixInput, Iterable[MatrixInput]]
 BasisType = Union[Literal['pauli', 'flatten'], Iterable[np.ndarray]]
 RescalingType = Literal['none', 'trace']
-RescalingInput = Union[RescalingType, List[float]]
+RescalingInput = Union[RescalingType, Sequence[float]]
 
 # Helper function to get Pauli basis for n qubits
 def _get_pauli_basis_product(num_qubits: int, normalized: bool = True) -> List[np.ndarray]:
@@ -238,22 +243,22 @@ def kets_to_vectorized_states_matrix(list_of_kets: List[NDArray[np.complex128]],
 
 
 def measure_povm(
-        state: Union[qutip.Qobj, Iterable[qutip.Qobj]],
-        povm: Union[Iterable[qutip.Qobj], POVM],
-        statistics: float,
-        return_frequencies: bool = False
-    ) -> NDArray:
+    states: Union[qutip.Qobj, Sequence[qutip.Qobj]],
+    povm: POVMType,
+    statistics: float,
+    return_frequencies: bool = False,
+    sampling_method: str = 'standard'
+) -> NDArray:
     """
-    Measure a POVM on a quantum state.
+    Measure a POVM on a quantum state, or a set of quantum states.
     Returns the measurement results as a list of integers, each integer representing one outcome of the POVM.
 
     Parameters:
     -----------
-    state : qutip.Qobj
-        The quantum state to be measured.
-    povm : list[qutip.Qobj]
-        A list of POVM operators.
-        Each operator must be a Hermitian operator.
+    states : Union[qutip.Qobj, Sequence[qutip.Qobj]]
+        The quantum state(s) to be measured.
+    povm : POVMType
+        The POVM to be measured.
     statistics : int or float
         The number of measurements to perform.
         The float is to accept the case of infinite statistics.
@@ -262,24 +267,26 @@ def measure_povm(
         If True, return the frequencies instead of the raw outcomes.
         Default is False.
     """
-    # make povm a list if it is not already
+    # ensure povm is properly formatted, if it's not already a POVM object
     if not isinstance(povm, POVM):
         povm = POVM(povm)
     
-    if not isinstance(state, qutip.Qobj):
-        state = list(state)
+    # if multiple states are provided, we measure each one separately
+    if isinstance(states, Sequence):
         # if a list of states is provided, we measure each one separately and return a matrix as output
-        results = [measure_povm(s, povm, statistics, return_frequencies) for s in state]
+        results = [measure_povm(state, povm, statistics, return_frequencies, sampling_method) for state in states]
         results = np.asarray(results)
-        return results.T
+        return results.T  # returns a matrix of shape (num_outcomes, num_states)
 
-    # if we're here then state is a single Qobj, not a list
-    if state.type != 'oper':
-        # convert it to a density matrix
-        state = qutip.ket2dm(state)
+    # if we're here then `states` is a single state. Check if it's a qutip.Qobj representing a density matrix
+    if not isinstance(states, qutip.Qobj):
+        raise TypeError("Input states must be qutip.Qobj or a sequence of qutip.Qobj.")
+    # convert it to a density matrix if it's not already one
+    if states.type == 'ket':
+        states = qutip.ket2dm(states)
 
     # compute the output probabilities
-    probabilities = [typing.cast(float, qutip.expect(state, effect)) for effect in povm]
+    probabilities = [typing.cast(float, qutip.expect(states, effect)) for effect in povm]
 
     # Check if statistics is infinity
     if np.isinf(statistics):
@@ -289,15 +296,20 @@ def measure_povm(
         else:
             raise ValueError("Cannot return raw outcomes for infinite statistics. Please set return_frequencies=True.")
     # sample from the output probabilities with statistics `statistics`
-    sampled_outcomes = np.random.choice(a=len(povm), size=round(statistics), p=probabilities)
-    
-
-    if return_frequencies:
-        # return the frequencies of each outcome
-        frequencies = np.bincount(sampled_outcomes, minlength=len(povm)) / statistics
+    if sampling_method == 'standard':
+        sampled_outcomes = np.random.choice(a=len(povm), size=round(statistics), p=probabilities)
+        if return_frequencies:
+            # return the frequencies of each outcome
+            frequencies = np.bincount(sampled_outcomes, minlength=len(povm)) / statistics
+            return frequencies
+        return sampled_outcomes
+    elif sampling_method == 'poisson':
+        if not return_frequencies:
+            raise ValueError("Can only return frequencies when using Poisson sampling.")
+        frequencies = np.random.poisson(lam=round(statistics) * np.asarray(probabilities)) / round(statistics)
         return frequencies
-    # otherwise, return the sampled outcomes
-    return sampled_outcomes
+    else:
+        raise ValueError(f"Unknown sampling method: {sampling_method}. Use 'standard' or 'poisson'.")
 
 # define a function that returns the single-qubit SIC-POVM
 def sic_povm() -> POVM:
@@ -319,9 +331,9 @@ def sic_povm() -> POVM:
     return POVM(povm, label="SIC")
 
 # extract the projections over the eigenstates of the three Pauli matrices
-def mub_povm():
+def mub_povm() -> POVM:
     """
-    Generate a POVM consisting of the projections over the eigenstates of the three Pauli matrices.
+    Generate a single-qubit POVM consisting of the projections over the eigenstates of the three Pauli matrices.
     The resulting POVM is a list of 6 rank-1 projectors.
     """
     ops = [
@@ -335,7 +347,7 @@ def mub_povm():
     normalized_povm = [op / 3 for op in ops]
     return POVM(normalized_povm, label="MUB")
 
-def random_rank1_povm(dim: int, num_outcomes: int, seed: Optional[bool] = None):
+def random_rank1_povm(dim: int, num_outcomes: int, seed: Optional[bool] = None) -> POVM:
     """
     Generate a random rank-1 POVM with d outcomes in a d-dimensional Hilbert space.
     The returned list [E_1, ..., E_d] satisfies sum_i E_i = I_d, 
