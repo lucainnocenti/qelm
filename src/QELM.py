@@ -3,14 +3,91 @@ import logging
 logger = logging.getLogger(__name__)
 import numpy as np
 import qutip
+from dataclasses import dataclass
 from IPython.display import Markdown, display
 from numpy.typing import NDArray
-from typing import Optional, TypedDict, List, Any, Union, Dict, cast, Sequence, Tuple
+from typing import Optional, TypedDict, List, Any, Union, Dict, cast, Sequence, Tuple, Literal
 
 from src.utils import truncate_svd
-from src.quantum_utils import kets_to_vectorized_states_matrix
-from src.types import TrainingData
-from src.POVM import POVMType
+from src.quantum_utils import measure_povm, QuantumStatesBatch, POVM, _make_observables_into_nparray, POVMType, ObservablesType
+from src.types import SamplingMethodType
+
+
+@dataclass
+class TrainingData:
+    """Holds the training frequencies and corresponding labels."""
+    frequencies: Optional[NDArray[np.float64]] = None
+    labels: Optional[NDArray[np.float64]] = None
+    states: Optional[QuantumStatesBatch] = None
+    observables: Optional[ObservablesType] = None
+    statistics: Optional[float] = None
+    sampling_method: Optional[SamplingMethodType] = None
+    povm: Optional[POVM] = None
+
+    @property
+    def can_train(self) -> bool:
+        """Check if the necessary data (frequencies, labels) is present."""
+        missing = []
+        if self.frequencies is None:
+            missing.append("frequencies")
+        if self.labels is None:
+            missing.append("labels")
+            
+        if missing:
+            logging.debug(f"Cannot train: missing {' and '.join(missing)} data.")
+            return False
+        return True
+    
+    @classmethod
+    def from_states_and_observables(cls,
+        states: QuantumStatesBatch,
+        observables: ObservablesType,
+        povm: POVM,
+        statistics: float,
+        sampling_method: SamplingMethodType = 'standard'
+    ) -> TrainingData:
+        """
+        Factory method to generate TrainingData from quantum states and observables.
+
+        Computes expectation values from given states and target observables,
+        and generates measurement frequencies using the provided POVM.
+
+        Parameters
+        ----------
+        states : QuantumStatesBatch
+            A batch of quantum states as a single numpy array
+        observables : ObservablesType
+            A sequence of observables (qutip.Qobj or numpy.ndarray) for which to compute expectation values.
+        povm : POVM
+        statistics : float
+            Number of measurement shots per state. If statistics is np.inf, it will use exact expectation values.
+        sampling_method : SamplingMethodType, optional
+            Method for sampling measurement outcomes ('standard' or 'poisson'). Default is 'standard'.
+
+        Returns
+        -------
+        TrainingData
+            An instance containing generated 'frequencies' and 'labels'.
+        """
+        n_states = len(states)
+        observables = _make_observables_into_nparray(observables)
+        n_observables = len(observables)
+
+        logging.debug(f"Generating training data for {n_states} states, {n_observables} observables, {statistics} shots/state.")
+
+        frequencies = states.measure_povm(povm=povm, statistics=statistics,
+                                          return_frequencies=True, sampling_method=sampling_method)
+
+        expvals = states.expvals(observables=observables)
+        trainingdata = cls(frequencies=frequencies, labels=expvals)
+        # Store additional information about the training data
+        trainingdata.povm = povm
+        trainingdata.statistics = statistics
+        trainingdata.sampling_method = sampling_method
+        trainingdata.states = states
+        trainingdata.observables = observables
+        # Return the instance
+        return trainingdata
 
 
 class QELM:
@@ -96,14 +173,14 @@ class QELM:
     
     @classmethod
     def train_from_observables_and_states(cls,
-        training_states: Sequence[qutip.Qobj],
-        target_observables: Sequence[qutip.Qobj],
-        povm: POVMType,
+        training_states: QuantumStatesBatch,
+        target_observables: ObservablesType,
+        povm: POVM,
         statistics: Union[float, Tuple[float, float]],
         method: str = 'standard',
         train_options: Dict[str, Any] = {},
-        test_states: Optional[Sequence[qutip.Qobj]] = None,
-        sampling_method: str = 'standard'
+        test_states: Optional[QuantumStatesBatch] = None,
+        sampling_method: SamplingMethodType = 'standard'
     ) -> QELM:
         """
         Factory method to create and train a QELM directly from input states and observables.
@@ -112,7 +189,7 @@ class QELM:
 
         Parameters
         ----------
-        training_states : Sequence[qutip.Qobj]
+        training_states : QuantumStatesBatch
             Quantum states for the training set.
         target_observables : Sequence[qutip.Qobj]
             Observables defining the target labels.
@@ -126,9 +203,9 @@ class QELM:
             Training method for the QELM (default: 'standard').
         train_options : Dict[str, Any], optional
             Options passed to the QELM training method.
-        test_states : Optional[Sequence[qutip.Qobj]], optional
+        test_states : Optional[QuantumStatesBatch], optional
             Quantum states for the test set (default: None).
-        sampling_method : str, optional
+        sampling_method : SamplingMethodType, optional
             Method for sampling measurement outcomes ('standard' or 'poisson').
 
         Returns
@@ -179,17 +256,12 @@ class QELM:
             test=test_data,
             method=method,
             train_options=train_options
-            # Pass w=None explicitly, as we want it to train
         )
-        # The __init__ method now handles calling _train
 
         return qelm_instance
 
 
-    def compute_state_shadow(
-        self,
-        truncate_singular_values: Union[bool, int] = False
-    ) -> QELM:
+    def compute_state_shadow(self, truncate_singular_values: Union[bool, int] = False) -> QELM:
         """
         Compute the state shadow of the QELM.
 
@@ -222,7 +294,7 @@ class QELM:
 
         
         # Convert the states (usually stored as kets) to vectorized density matrices.\
-        raise NotImplementedError("This function needs rethinking.")
+        raise NotImplementedError("This shit needs rethinking.")
         states_matrix = kets_to_vectorized_states_matrix(self.train.states, basis='pauli')
         self.state_shadow = np.dot(states_matrix, np.linalg.pinv(frequencies))
         return self
@@ -245,12 +317,7 @@ class QELM:
             raise ValueError('Model is not trained (W is not set).')
         return np.dot(self.w, probabilities)
 
-    def compute_MSE(
-        self,
-        train: bool = True,
-        test: bool = True,
-        display_results: bool = True
-    ) -> QELM:
+    def compute_MSE(self, train: bool = True, test: bool = True, display_results: bool = True) -> QELM:
         """
         Compute the mean squared error (MSE) for the train and/or test data.
 
@@ -304,3 +371,26 @@ class QELM:
             display(merged_md)
         
         return self
+
+    # a function to compute the squared bias from the trained model w
+    def bias2(self) -> NDArray[np.float64]:
+        """
+        Compute the squared bias from the trained model.
+
+        Returns
+        --------
+        np.ndarray
+            The squared bias.
+        """
+        if self.w is None:
+            raise ValueError('Model is not trained (W is not set).')
+        # both train and test data must have been provided
+        if self.train is None or self.test is None:
+            raise ValueError('Train and test data must be provided to compute bias.')
+        if self.train.labels is None or self.test.labels is None:
+            raise ValueError('Train and test labels must be provided to compute bias.')
+        if self.train.frequencies is None or self.test.frequencies is None:
+            raise ValueError('Train and test frequencies must be provided to compute bias.')
+        # multiply the train w by the test frequencies to get the bias
+        bias = np.dot(self.w, self.test.frequencies) - self.test.labels
+        return bias ** 2

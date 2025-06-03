@@ -1,3 +1,4 @@
+from __future__ import annotations
 import itertools
 import logging
 logger = logging.getLogger(__name__)
@@ -6,202 +7,566 @@ import qutip
 import numpy as np
 
 # --- Type Hinting Setup ---
-from numpy.typing import NDArray
+from numpy.typing import NDArray, ArrayLike
 import typing
-from typing import List, Union, Iterable, Optional, Literal, Sequence, cast
+from typing import List, Union, Iterable, Optional, Literal, Sequence, cast, ClassVar
+from dataclasses import dataclass
+from functools import cached_property
 # --- Custom types imports ---
-from src.POVM import POVMType
+from src.types import BasisType, SamplingMethodType
 
-# --- Custom imports ---
-from src.POVM import POVM
 
-# Define Type Aliases for clarity
-MatrixInput = Union[qutip.Qobj, np.ndarray]
-MatrixListInput = Union[MatrixInput, Iterable[MatrixInput]]
-BasisType = Union[Literal['pauli', 'flatten'], Iterable[np.ndarray]]
-RescalingType = Literal['none', 'trace']
-RescalingInput = Union[RescalingType, Sequence[float]]
+# --------------------------------------------------------------------------- #
+# Pauli basis
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class PauliBasis:
+    """n-qubit tensor-product Pauli operators.
 
-# Helper function to get Pauli basis for n qubits
-def _get_pauli_basis_product(num_qubits: int, normalized: bool = True) -> List[np.ndarray]:
+    The idea is to enable generating the full set of Pauli operators via a generator
+    (so not necessarily having the whole thing in memory)
+
+    Usage:
+    >>> pb = PauliBasis(num_qubits=2).matrices
+
+    Parameters
+    ----------
+    num_qubits :
+        Number of qubits *n* (must be positive).
+    normalised :
+        If *True*, scale each matrix by ``1/sqrt(2**n)`` so that
+        ``Tr(P_i P_j) = δ_ij``.
+    include_identity :
+        If *False*, the first element (I⊗n) is omitted.
+        Useful for traceless-only applications.
     """
-    Generates the tensor product Pauli basis for n qubits.
 
-    The basis elements B_k satisfy Tr(B_j B_k) = d * δ₍ⱼₖ₎, where d=2ⁿ.
-    The basis always includes the identity operator.
+    num_qubits: int
+    normalised: bool = True
+    include_identity: bool = True
 
-    Args:
-        num_qubits: Number of qubits (must be > 0).
-        normalized: If True, normalize each basis element so that Tr(σᵢ²) = 1.
-
-    Returns:
-        List[np.ndarray]: A list of dxd NumPy arrays representing the basis elements.
-    """
-    if num_qubits <= 0:
-        raise ValueError("Number of qubits must be positive.")
-
-    d = 2**num_qubits
-    single_qubit_paulis = {
-        'I': qutip.qeye(2),
-        'X': qutip.sigmax(),
-        'Y': qutip.sigmay(),
-        'Z': qutip.sigmaz()
+    # -- single-qubit paulis ------------------------------------------------- #
+    _PAULIS: ClassVar[dict[str, NDArray]] = {
+        "I": np.eye(2, dtype=complex),
+        "X": np.array([[0, 1], [1, 0]], dtype=complex),
+        "Y": np.array([[0, -1j], [1j, 0]], dtype=complex),
+        "Z": np.array([[1, 0], [0, -1]], dtype=complex),
     }
 
-    # Generate all Pauli strings of length num_qubits.
-    pauli_strings = itertools.product(['I', 'X', 'Y', 'Z'], repeat=num_qubits)
-    basis_qobj = [qutip.tensor(*(single_qubit_paulis[p] for p in ps)) for ps in pauli_strings]
-    basis_np = [op.full() for op in basis_qobj]
+    # -- lazy materialisation ------------------------------------------------ #
+    @cached_property
+    def labels(self) -> List[str]:
+        """Lexicographically ordered list of operator labels."""
+        labels = [
+            "".join(prod)
+            for prod in itertools.product(self._PAULIS, repeat=self.num_qubits)
+        ]
+        if not self.include_identity:
+            labels = [lab for lab in labels if lab != "I" * self.num_qubits]
+        return labels
 
-    if normalized:
-        # Normalize such that each basis element has unit trace square.
-        basis_np = [b / np.sqrt(d) for b in basis_np]
+    @cached_property
+    def factor(self) -> float:
+        """Normalisation factor applied to every matrix."""
+        return 1 / np.sqrt(2**self.num_qubits) if self.normalised else 1.0
 
-    return basis_np
+    def _build_matrix(self, label: str) -> NDArray:
+        """Materialise a single tensor product."""
+        mat: NDArray = self._PAULIS[label[0]]
+        for char in label[1:]:
+            mat = np.kron(mat, self._PAULIS[char])
+        return mat * self.factor
+
+    @cached_property
+    def matrices(self) -> List[NDArray]:
+        """**Materialises** and stores all matrices (may be huge!)."""
+        return [self._build_matrix(lab) for lab in self.labels]
+
+    # -- iterator interface -------------------------------------------------- #
+    def __iter__(self):
+        for lab in self.labels:
+            yield self._build_matrix(lab)
+
+    def __len__(self) -> int:
+        return len(self.labels)
 
 
-def _preprocess_matrices(matrices_in: MatrixListInput) -> List[np.ndarray]:
-    """
-    Converts the input to a list of NumPy arrays and checks validity.
-    This is just to ensure the matrices are in the correct format and type.
+# --------------------------------------------------------------------------- #
+# Representations of quantum states
+# --------------------------------------------------------------------------- #
 
-    Args:
-        matrices_in: A single matrix (qutip.Qobj or np.ndarray) or a sequence of such matrices.
 
-    Returns:
-        List[np.ndarray]: List of matrices as NumPy arrays.
-    """
-    # Avoid iterating over a NumPy array representing a single matrix.
-    if isinstance(matrices_in, (qutip.Qobj, np.ndarray)):
-        matrices = [matrices_in]
-    elif isinstance(matrices_in, Iterable):
-        matrices = list(matrices_in)
-    else:
-        raise TypeError("Input must be a qutip.Qobj, numpy.ndarray, or a sequence of these.")
+class QuantumOperator:
+    def __init__(self, matrix: ArrayLike):
+        matrix = np.asarray(matrix, dtype=np.complex128)
+        if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+            raise ValueError("Input must be a square 2D array (density matrix).")
+        self.data = matrix
+        self.dim: int = matrix.shape[0]
 
-    if not matrices:
-        raise ValueError("Input matrix list cannot be empty.")
+    @classmethod
+    def from_ket(cls, vector: np.ndarray) -> QuantumOperator:
+        """Re-create a QuantumOperator from a ket vector, via outer product."""
+        return cls(np.outer(vector, vector.conj()))
 
-    matrices_np = []
-    for mat in matrices:
-        if isinstance(mat, qutip.Qobj):
-            if not mat.isoper:
-                raise TypeError("Input Qobj must be an operator.")
-            mat_np = mat.full()
-        elif isinstance(mat, np.ndarray):
-            mat_np = mat
+    @classmethod
+    def from_vector(cls, vec: np.ndarray, basis: BasisType = "pauli") -> QuantumOperator:
+        """Re-create a QuantumState from a vectorised representation."""
+        return cls(unvectorize_op(vec, basis=basis))
+
+    def vectorise(self, basis: BasisType = "pauli") -> np.ndarray:
+        """Return the coordinate vector of rho in the chosen basis."""
+        return vectorise_op(self.data, basis=basis)
+
+    def asbatch(self) -> QuantumOperatorsBatch:
+        """Convert the quantum density matrix to a batch representation."""
+        return QuantumOperatorsBatch(self.data[None, :, :])
+
+
+class QuantumOperatorsBatch:
+    """A batch of quantum operators (density matrices, observables, etc), represented as a 3D array (shape: n_ops x dim x dim)."""
+    def __init__(self, operators: ArrayLike):
+        operators = np.asarray(operators, dtype=np.complex128)
+        if operators.ndim != 3 or operators.shape[1] != operators.shape[2]:
+            raise ValueError("Input must be a 3D array (shape: n_ops x dim x dim).")
+        self.data = operators
+        self.dim: int = operators.shape[1]
+        self.n_ops: int = operators.shape[0]
+
+    def __len__(self) -> int: return self.n_ops
+    def __iter__(self): return iter(self.data)
+    def __getitem__(self, index): return self.data[index]
+
+    def vectorise(self, basis: BasisType = "pauli") -> NDArray:
+        """Vectorise each operator in the batch in the specified basis.
+        
+        Parameters:
+            basis (BasisType): The basis in which to vectorise the operators.
+                Can be 'pauli', 'flatten', or a list of matrices.
+        Returns:
+            NDArray: A 2D array where each row corresponds to a vectorised operator.
+            If basis is 'flatten', the shape is (dim * dim, n_ops).
+            If basis is a list of matrices, the shape is (n_basis_ops, n_ops).
+        """
+        if isinstance(basis, str) and basis == 'flatten':
+            # return a 2D array where each row is a vectorised matrix
+            return self.data.reshape(self.n_ops, -1)
         else:
-            raise TypeError(f"Unsupported matrix type: {type(mat)}. Use qutip.Qobj or numpy.ndarray.")
-        matrices_np.append(mat_np)
-    return matrices_np
+            basis_ = _make_basis_into_nparray(basis, self.dim)
+            matrix = np.einsum('nij,kij->nk', self.data, basis_.conj(), optimize=True).T
+            if basis == 'pauli':
+                return matrix.real
+            return matrix
 
-def unvectorize_matrix(vector: np.ndarray,
-                        d: Optional[int] = None,
-                        basis: BasisType = 'pauli',
-                        pauli_basis: Optional[Iterable[np.ndarray]] = None) -> np.ndarray:
+# class representing POVM (as a list of qutip.Qobj) and the associated label, for example, "SIC", "MUB", etc.
+class POVM(QuantumOperatorsBatch):
+    """A POVM, represented as a batch of quantum operators (the effects).
+    """    
+    def __init__(self, elements: ArrayLike, label: Optional[str] = None):
+        """Initialize a POVM with the given elements.
+        """
+        QuantumOperatorsBatch.__init__(self, elements)
+        # Generate default label if none provided
+        if label is None:
+            label = f"unknown, {len(self)} outcomes"
+        self.label = label
+
+    def __repr__(self) -> str:
+        return f"POVM(label={self.label}, num_outcomes={self.n_ops})"
+
+
+# --- Type Definitions ---
+POVMElement = Union[qutip.Qobj, ArrayLike]
+POVMType = Union[Sequence[POVMElement], POVM]  # Allow sequences or the POVM class
+ObservablesType = Union[Sequence[qutip.Qobj], qutip.Qobj, Sequence[ArrayLike], ArrayLike, QuantumOperator, QuantumOperatorsBatch]
+
+
+
+class QuantumState:
+    """Base class for quantum states, providing a common interface."""
+    def __init__(self, dim: int):
+        if dim <= 0:
+            raise ValueError("Dimension must be a positive integer.")
+        self.dim = dim
+
+    def todm(self) -> QuantumDensityMatrix:
+        """Convert the quantum state to a density matrix representation."""
+        raise NotImplementedError("Subclasses must implement this method.")
+
+    def vectorise(self, basis: BasisType = "pauli") -> np.ndarray:
+        """Return the coordinate vector of the state in the chosen basis."""
+        raise NotImplementedError("Subclasses must implement this method.")
+    
+    def asbatch(self) -> QuantumStatesBatch:
+        """Convert the quantum state to a batch representation."""
+        raise NotImplementedError("Subclasses must implement this method.")
+
+    def expvals(self, observables: ObservablesType) -> NDArray[np.float64]:
+        return self.asbatch().expvals(observables).flatten()
+
+    def measure_povm(self, povm: POVM, statistics: float,
+                     sampling_method: SamplingMethodType = 'standard',
+                     return_frequencies: bool = False) -> NDArray:
+        return self.asbatch().measure_povm(
+            povm=povm,
+            statistics=statistics,
+            sampling_method=sampling_method,
+            return_frequencies=return_frequencies
+        ).flatten()
+
+
+class QuantumKet(QuantumState):
+    """Density-operator wrapper with vectorisation helpers."""
+    # --------------- construction helpers ---------------------------------- #
+    def __init__(self, vec: NDArray | Sequence[complex]):
+        data = np.asarray(vec, dtype=np.complex128)
+        if data.ndim != 1:
+            raise ValueError("Input vector must be 1D (a ket).")
+        self.data = data
+        self.dim: int = data.shape[0]
+
+    def todm(self) -> QuantumDensityMatrix:
+        """Converts into a density matrix representation (as a 2D array)."""
+        return QuantumDensityMatrix.from_ket(self.data)
+
+    def vectorise(self, basis: BasisType = "pauli") -> np.ndarray:
+        """Return the coordinate vector of rho in the chosen basis.
+        The operation is devolved to QuantumDensityMatrix.vectorise().
+        """
+        return QuantumDensityMatrix.from_ket(self.data).vectorise(basis=basis)
+    
+    def asbatch(self) -> QuantumKetsBatch:
+        """Convert the quantum ket to a batch representation."""
+        return QuantumKetsBatch(self.data[None, :])
+
+    # def expvals(self, observables: ObservablesType) -> NDArray[np.float64]:
+    #     """Calculate the expectation values of the given observables for each ket in the batch.
+        
+    #     Parameters:
+    #         observables (Union[qutip.Qobj, Sequence[qutip.Qobj], NDArray]): A single observable or a sequence of observables.
+        
+    #     Returns:
+    #         NDArray[np.float64]: The expectation values, shape (n_observables, n_states).
+    #     """
+    #     # parse input to ensure observables is a 3D array
+    #     observables_np = _make_observables_into_nparray(observables)
+    #     # compute the expectation values
+    #     return expvals_from_kets_and_observables_numpy(kets=self.data, observables=observables_np).flatten()
+
+
+class QuantumDensityMatrix(QuantumOperator, QuantumState):
+    """Density matrix representation of a quantum state."""
+    def __init__(self, matrix: NDArray[np.complex128]):
+        QuantumOperator.__init__(self, matrix)
+
+    @classmethod
+    def from_ket(cls, vector: NDArray[np.complex128]) -> QuantumDensityMatrix:
+        """Create a density matrix from a ket vector."""
+        return cls(np.outer(vector, vector.conj()))
+
+    def todm(self) -> QuantumDensityMatrix:
+        """Returns itself as it is already a density matrix."""
+        return self
+
+    def asbatch(self) -> QuantumDensityMatricesBatch:
+        """Convert the quantum density matrix to a batch representation."""
+        return QuantumDensityMatricesBatch(self.data[None, :, :])
+    
+    # def expvals(self, observables: ObservablesType) -> NDArray[np.float64]:
+    #     # parse input to ensure observables is a 3D array
+    #     observables_np = _make_observables_into_nparray(observables)
+    #     # compute the expectation values
+    #     return expvals_from_dms_and_observables_numpy(dms=self.data, observables=observables_np).flatten()
+
+
+class QuantumStatesBatch:
+    """Base class for batches of quantum states, providing a common interface.
+    
+    The point of these classes is to provide efficient handling of multiple states avoiding for loops.
+    """
+    def __init__(self):
+        self.data: NDArray[np.complex128]
+        self.n_states: int
+        self.dim: int
+        raise NotImplementedError("Subclasses must implement this method.")
+    
+    def vectorise(self, basis: BasisType = "pauli") -> NDArray[np.complex128]:
+        raise NotImplementedError("Subclasses must implement this method.")
+    
+    def measure_povm(self, povm: POVM, statistics: float, 
+                     sampling_method: SamplingMethodType = 'standard',
+                     return_frequencies: bool = False) -> NDArray:
+        raise NotImplementedError("Subclasses must implement this method.")
+    
+    def expvals(self, observables: ObservablesType) -> NDArray[np.float64]:
+        raise NotImplementedError("Subclasses must implement this method.")
+    
+    def __len__(self) -> int:
+        raise NotImplementedError("Subclasses must implement this method.")
+    
+
+class QuantumKetsBatch(QuantumStatesBatch):
+    """A batch of quantum kets, represented as a 2D array (shape: n_states x dim)."""
+
+    def __init__(self, kets: Sequence | NDArray[np.complex128]):
+        self.data = np.asarray(kets, dtype=np.complex128)
+        if self.data.ndim != 2:
+            raise ValueError("Input must be a 2D array (shape: n_states x dim).")
+        self.dim: int = self.data.shape[1]
+        self.n_states: int = self.data.shape[0]
+
+    def todm(self) -> QuantumDensityMatricesBatch:
+        """Convert each ket in the batch to a density matrix."""
+        matrices = np.einsum('ni,nj->nij', self.data, self.data.conj(), optimize=True)
+        return QuantumDensityMatricesBatch(matrices)
+    
+    def vectorise(self, basis: BasisType = "pauli") -> NDArray[np.complex128]:
+        return self.todm().vectorise(basis=basis)
+    
+    def measure_povm(self, povm: POVM, statistics: float,
+                     sampling_method: SamplingMethodType = 'standard',
+                     return_frequencies: bool = False) -> NDArray:
+        """Measure a POVM on each ket in the batch, with some given statistics.
+        
+        Parameters:
+            povm (POVM): The POVM to measure.
+            statistics (float): Number of measurement shots PER KET. Use np.inf for exact probabilities.
+            sampling_method (str): 'standard' or 'poisson'.
+            return_frequencies (bool): If True, return frequencies instead of raw outcomes.
+        Returns:
+            NDArray: The measurement outcomes or frequencies.
+            If return_frequencies is True, shape is (n_povm_outcomes, n_states).
+            If return_frequencies is False, shape is (n_states, statistics).
+        """
+        if not isinstance(povm, POVM):
+            raise TypeError("POVM must be an instance of the POVM class.")
+        probabilities = expvals_from_kets_and_observables_numpy(self.data, povm.data)
+        return sample_from_probabilities(
+            probabilities.T,
+            statistics,
+            return_frequencies=return_frequencies,
+            sampling_method=sampling_method
+        ).T
+    
+    def expvals(self, observables: ObservablesType) -> NDArray[np.float64]:
+        """Calculate the expectation values of the given observables for each ket in the batch.
+        
+        Parameters:
+            observables (Union[qutip.Qobj, Sequence[qutip.Qobj], NDArray]): A single observable or a sequence of observables.
+        
+        Returns:
+            NDArray[np.float64]: The expectation values, shape (n_observables, n_states).
+        """
+        # parse input to ensure observables is a 3D array
+        observables_np = _make_observables_into_nparray(observables)
+        # compute the expectation values
+        return expvals_from_kets_and_observables_numpy(kets=self.data, observables=observables_np)
+
+    def __len__(self) -> int: return self.n_states
+
+
+
+
+class QuantumDensityMatricesBatch(QuantumOperatorsBatch, QuantumStatesBatch):
+    """A batch of quantum density matrices, represented as a 3D array (shape: n_dms x dim x dim)."""
+    def __init__(self, matrices: NDArray):
+        QuantumOperatorsBatch.__init__(self, matrices)
+        self.n_states = self.n_ops  # n_dms is the same as n_states in this context
+
+    def expvals(self, observables: ObservablesType) -> NDArray[np.float64]:
+        """Calculate the expectation values of the given observables for each density matrix in the batch.
+        
+        Parameters:
+            observables (ObservablesType): A single observable or a sequence of observables.
+        
+        Returns:
+            NDArray[np.float64]: The expectation values, shape (n_observables, n_matrices).
+        """
+        # parse input to ensure observables is a 3D array
+        observables_np = _make_observables_into_nparray(observables)
+        # compute the expectation values
+        return expvals_from_dms_and_observables_numpy(dms=self.data, observables=observables_np)
+    
+    def measure_povm(self, povm: POVM, statistics: float,
+                     sampling_method: SamplingMethodType = 'standard',
+                     return_frequencies: bool = False) -> NDArray:
+        """Measure a POVM on each density matrix in the batch, with the specified statistics.
+        
+        Parameters:
+            povm (POVM): The POVM to measure.
+            statistics (float): Number of measurement shots PER DENSITY MATRIX. Use np.inf for exact probabilities.
+            sampling_method (str): 'standard' or 'poisson'.
+            return_frequencies (bool): If True, return frequencies instead of raw outcomes.
+        Returns:
+            NDArray: The measurement outcomes or frequencies.
+            If return_frequencies is True, shape is (n_povm_outcomes, n_matrices).
+            If return_frequencies is False, shape is (n_matrices, statistics).
+        """
+        if not isinstance(povm, POVM):
+            raise TypeError("POVM must be an instance of the POVM class.")
+        probabilities = expvals_from_dms_and_observables_numpy(self.data, povm.data)
+        return sample_from_probabilities(
+            probabilities.T,
+            statistics,
+            return_frequencies=return_frequencies,
+            sampling_method=sampling_method
+        ).T
+
+
+def _make_observables_into_nparray(observables: ObservablesType) -> NDArray:
+    """Helper function to parse the ObservablesType argument.
+    
+    Used eg by expvals_from_states_and_observables_qutip and expvals_from_kets_and_observables_numpy.
+    Ensures that observables is a 3D array (shape: n_observables x dim x dim).
+    """
+    # print(observables)
+    # print(isinstance(observables, QuantumOperatorsBatch))
+    if isinstance(observables, QuantumOperator):
+        # if it's a single QuantumOperator, convert it to a 3D array
+        observables_np = observables.data.reshape(1, *observables.data.shape)
+    elif isinstance(observables, QuantumOperatorsBatch):
+        # if it's a QuantumOperatorsBatch, we can use its data directly
+        observables_np = observables.data
+    elif isinstance(observables, qutip.Qobj):
+        observables_np = observables.full()[None, :, :]
+    elif isinstance(observables, Sequence) and all(isinstance(obs, qutip.Qobj) for obs in observables):
+        observables_np = np.array(
+            [cast(qutip.Qobj, obs).full() for obs in observables],
+            dtype=np.complex128)
+    elif isinstance(observables, Sequence) and all(isinstance(obs, np.ndarray) for obs in observables):
+        # assume each observable is a 2D array (a matrix)
+        observables_np = np.array(observables, dtype=np.complex128)
+    elif isinstance(observables, np.ndarray):
+        if observables.ndim == 2:
+            # if it's a 2D array, we assume it's a single observable
+            observables = observables[None, :, :]  # reshape to 3D (1, dim, dim)
+        elif observables.ndim != 3 or observables.shape[1] != observables.shape[2]:
+            raise ValueError("Observables must be a 3D array (shape: n_observables x dim x dim).")
+        observables_np = observables
+    else:
+        raise TypeError("Observables must be a qutip.Qobj, a sequence of qutip.Qobj, or a numpy array.")
+    return observables_np
+
+
+def _make_basis_into_nparray(basis: BasisType, dim: int) -> NDArray[np.complex128]:
+    """Helper function to parse the BasisType argument.
+    
+    Used eg by vectorise_op and unvectorize_op.
+    """
+    if isinstance(basis, str):
+        if basis == 'pauli':
+            num_qubits = int(np.log2(dim))
+            if 2**num_qubits != dim:
+                raise ValueError(f"Pauli basis is only supported for dimensions d = 2^n (n > 0). Got d={dim}.")
+            basis_ = np.asarray(PauliBasis(num_qubits=num_qubits, normalised=True).matrices)
+        else:
+            raise ValueError(f"Unknown basis type: {basis}. Must be 'pauli' or 'flatten'.")
+    elif isinstance(basis, Sequence):
+        # if basis is a sequence we assume it's a list of matrices
+        if not isinstance(basis[0], np.ndarray) or basis[0].ndim != 2 or len(basis) == 0:
+            raise ValueError("If basis is a sequence, it must be a list of 2D matrices.")
+        basis_ = np.asarray(basis, dtype=np.complex128)
+    elif isinstance(basis, np.ndarray):
+        if basis.ndim != 3:
+            raise ValueError(f"Basis must be a 3D array (list of operators). Got {basis.ndim} dimensions.")
+        basis_ = basis
+    else:
+        raise ValueError(f"Unknown basis type: {basis}. Must be 'pauli', 'flatten', or a list of matrices.")
+    return basis_
+
+
+def sequence_of_qutip_qobj_to_states_batch(data: Sequence[qutip.Qobj]) -> QuantumStatesBatch:
+    """Convert a sequence of qutip.Qobj to a QuantumStatesBatch."""
+    if not all(isinstance(item, qutip.Qobj) for item in data):
+        raise TypeError("All items in the sequence must be qutip.Qobj.")
+    # check if all elements are kets
+    if all(item.isket for item in data):
+        # if all items are kets, we can create a QuantumKetsBatch
+        matrices = np.array([item.full().flatten() for item in data], dtype=np.complex128)
+        return QuantumKetsBatch(matrices)
+    elif all(item.isoper for item in data):
+        # if all items are operators (density matrices), we can create a QuantumDensityMatricesBatch
+        matrices = np.array([item.full() for item in data], dtype=np.complex128)
+        return QuantumDensityMatricesBatch(matrices)
+    else:
+        raise ValueError("All items in the sequence must be either kets or density matrices (operators).")
+
+
+def unvectorize_op(vector: NDArray, basis: BasisType = 'pauli') -> NDArray:
     """
     Converts a flattened vector back into a dxd matrix using the specified basis.
 
     Args:
         vector: The flattened matrix as a 1D NumPy array.
-        d: The target dimension. If None, it is inferred from the vector length.
         basis: Either 'pauli', 'flatten', or an iterable of basis matrices.
-        pauli_basis: Optional precomputed Pauli basis (if basis is 'pauli').
 
     Returns:
         np.ndarray: The reconstructed dxd matrix.
     """
     # make sure the vector is 1D or equivalent to 1D (ie 2D with one column)
-    if vector.ndim != 1:
-        if vector.ndim == 2 and vector.shape[1] == 1:
-            vector = vector.flatten()
-        else:
-            raise ValueError(f"Input vector must be 1D. Got an array with {vector.ndim} dimensions.")
+    if not isinstance(vector, np.ndarray) or vector.ndim != 1:
+        raise ValueError(f"Input vector must be 1D. Got an array with {vector.ndim} dimensions.")
     # compute the dimension if not provided, assuming the provided vector comes vectorizing a d*d matrix
-    if d is None:
-        d = int(np.sqrt(vector.size))
-        if d * d != vector.size:
-            raise ValueError(f"Vector length {vector.size} is not a perfect square.")
+    d = int(np.sqrt(vector.size))
+    if d * d != vector.size:
+        raise ValueError(f"Vector length {vector.size} is not a perfect square.")
 
-    if basis == 'flatten':
+    if isinstance(basis, str) and basis == 'flatten':
         return vector.reshape((d, d))
-    elif basis == 'pauli':
-        if d <= 0 or (d & (d - 1)) != 0:
-            raise ValueError(f"Dimension {d} must be a power of 2 for Pauli basis.")
-        num_qubits = int(np.log2(d))
-        if pauli_basis is None:
-            pauli_basis = _get_pauli_basis_product(num_qubits, normalized=True)
-        else:
-            pauli_basis = list(pauli_basis)
-        
-        if len(pauli_basis) != d * d:
-            raise RuntimeError("Mismatch in the number of Pauli basis elements.")
-        matrix = np.zeros((d, d), dtype=np.complex128)
-        for k in range(d * d):
-            matrix += vector[k] * pauli_basis[k]
-        return matrix
-    # If a list of matrices is provided, use them for unvectorization
-    elif isinstance(basis, Iterable):
-        basis_list = list(basis)
-        if len(basis_list) != d * d:
-            raise ValueError(f"Provided basis length {len(basis_list)} does not match d*d = {d*d}.")
-        matrix = np.zeros((d, d), dtype=np.complex128)
-        for k in range(d * d):
-            matrix += vector[k] * basis_list[k]
-        return matrix
     else:
-        raise ValueError(f"Unknown basis type: {basis}")
+        basis_ = _make_basis_into_nparray(basis, d)  # returns a 3D array of shape (n_ops, d, d)
+
+    # compute the op as \sum_k vector[k] * basis_[k]
+    op = np.einsum('k,kij->ij', vector, basis_, optimize=True)
+    return op
 
 
-def vectorize_density_matrix(matrices_in: MatrixListInput,
-                             basis: BasisType = 'pauli') -> np.ndarray:
-    r"""
-    Vectorizes one or more Hermitian matrices using the specified basis.
+def vectorise_op(op: NDArray, basis: BasisType = 'pauli') -> NDArray:
+    """Vectorise an operator in a given basis.
+    
+    Parameters:
+        op (NDArray): The operator to vectorise. It should be a 2D array (a matrix, eg a density operator).
+        basis (BasisType): The basis in which to vectorise the operator.
+            Can be 'pauli', 'flatten', or a list of matrices.
+    """
+    if not isinstance(op, np.ndarray) and op.ndim != 2:
+        raise ValueError(f"Operator must be a 2D array (matrix). Got {op.ndim} dimensions.")
+    if isinstance(basis, str) and basis == 'flatten':
+        return op.flatten()
+    else:
+        basis_ = _make_basis_into_nparray(basis, op.shape[0])
 
-    If basis == 'pauli', the vectorization is defined as
-      $$ v_k = \mathrm{Tr}(M B_k), $$
-    where $$B_k$$ are the Pauli basis elements.
-    For basis == 'flatten', the matrix is simply flattened row by row.
+    if basis_.shape[1] != op.shape[0] or basis_.shape[2] != op.shape[1]:
+        raise ValueError(f"Basis shape {basis_.shape} does not match operator shape {op.shape}.")
 
-    Args:
-        matrices_in: A single matrix (qutip.Qobj or np.ndarray) or sequence of matrices.
-        basis: The vectorization basis: 'pauli', 'flatten', or a custom iterable of matrices.
+    # actual bloody computation
+    vec = np.einsum('ij,kij->k', op, basis_.conj())
+    # if the basis is Pauli, we return the real part only
+    if basis == 'pauli':
+        return vec.real
+    return vec
+
+
+def vectorise_op_paulis(op: ArrayLike) -> NDArray[np.float64]:
+    """
+    Vectorize an operator in the Pauli basis.
+
+    Parameters:
+    -----------
+    op : NDArray[np.complex128]
+        The operator to vectorize, expected to be a 2D array (matrix).
 
     Returns:
-        np.ndarray: A 2D array of shape (d*d, num_matrices) whose columns are the vectorized matrices.
+    --------
+    NDArray[np.float64]
+        The vectorized operator in the Pauli basis.
     """
-    matrices_np = _preprocess_matrices(matrices_in)
-    d = matrices_np[0].shape[0]  # Assuming all matrices share the same dimension.
-    vectorized_mats = []
-
-    if basis == 'pauli':
-        num_qubits = np.log2(d)
-        if not num_qubits.is_integer() or num_qubits <= 0:
-            raise ValueError(f"Pauli basis is only supported for dimensions d = 2^n (n > 0). Got d={d}.")
-        pauli_basis = _get_pauli_basis_product(int(num_qubits), normalized=True)
-        if len(pauli_basis) != d * d:
-            raise RuntimeError("Internal error: Generated Pauli basis size is incorrect.")
-        for mat in matrices_np:
-            vec = np.array([np.trace(mat @ p).real for p in pauli_basis], dtype=float)
-            vectorized_mats.append(vec)
-    elif basis == 'flatten':
-        for mat in matrices_np:
-            vectorized_mats.append(mat.flatten())
-    elif isinstance(basis, Iterable):
-        basis_list = list(basis)
-        if len(basis_list) != d * d:
-            raise ValueError(f"Provided basis length {len(basis_list)} does not match d*d = {d*d}.")
-        for mat in matrices_np:
-            vec = np.array([np.trace(mat @ b) for b in basis_list], dtype=complex)
-            vectorized_mats.append(vec)
-    else:
-        raise ValueError(f"Unknown basis type: {basis}")
-    # Stack the vectorized matrices into a 2D array
-    # Each column corresponds to a vectorized matrix.
-    return np.column_stack(vectorized_mats)
+    op = np.asarray(op, dtype=np.complex128)
+    pauli_basis = PauliBasis(num_qubits=int(np.log2(op.shape[0])), normalised=True).matrices
+    return vectorise_op(op, np.array(pauli_basis, dtype=np.complex128)).real
 
 
-def ket2dm(ket: NDArray[np.complex128]) -> NDArray[np.complex128]:
+def ket2dm(ket: ArrayLike) -> NDArray[np.complex128]:
     """
     Convert a ket (state vector) to a density matrix.
 
@@ -219,46 +584,228 @@ def ket2dm(ket: NDArray[np.complex128]) -> NDArray[np.complex128]:
     return ket @ ket.conj().T
 
 
-def kets_to_vectorized_states_matrix(list_of_kets: Sequence[NDArray[np.complex128]], basis: BasisType = 'pauli') -> NDArray[np.complex128]:
-    """
-    Convert a list of kets to a vectorized states matrix.
 
-    This function takes a list of kets and converts them to a matrix of vectorized states.
-    The result is a matrix of dimensions (dim^2, num_states), where dim is the dimension of the density matrix.
+def random_kets(dim: int, num_kets: int, seed: Optional[int] = None) -> NDArray[np.complex128]:
+    """
+    Generate a list of random kets in a d-dimensional Hilbert space.
+    This is much faster than generating random states using qutip.rand_ket, especially for many kets.
 
     Parameters:
     -----------
-    list_of_kets : List[NDArray[np.complex128]]
-        The list of kets to convert.
-    basis : str, optional
-        The basis in which to vectorize the states (default is 'paulis').
+    dim : int
+        The dimension of the Hilbert space.
+    num_kets : int
+        The number of random kets to generate.
+    seed : Optional[int], optional
+        Seed for reproducibility (default is None).
 
     Returns:
     --------
-    NDArray[np.complex128]
-        The matrix of vectorized states.
+    List[NDArray[np.complex128]]
+        A list of random kets, each represented as a NumPy array.
     """
-    return np.array(
-        [vectorize_density_matrix(ket2dm(ket), basis=basis) for ket in list_of_kets]
-    ).T
+    if seed is not None:
+        np.random.seed(seed)
+    
+    # Step 1: Generate D complex numbers with real and imaginary parts from N(0,1)
+    # For a batch of num_kets, this will be an array of shape (num_kets, dim)
+    raw_complex_vectors = np.random.randn(num_kets, dim) + 1j * np.random.randn(num_kets, dim)
+
+    # Step 2: Normalize each vector
+    # Calculate the L2 norm along the dimension axis (axis=1)
+    # norms will be of shape (num_kets,)
+    norms = np.linalg.norm(raw_complex_vectors, axis=1)
+
+    # Normalize. We need to reshape norms to (num_kets, 1) for broadcasting
+    # (num_kets, dim) / (num_kets, 1) -> (num_kets, dim)
+    haar_states = raw_complex_vectors / norms[:, np.newaxis]
+    if not isinstance(haar_states, np.ndarray):
+        raise TypeError("Generated states should be a NumPy array. Some weird shit happened because it's not.")
+
+    return haar_states
 
 
-def measure_povm(
+def expvals_from_states_and_observables_qutip(
     states: Union[qutip.Qobj, Sequence[qutip.Qobj]],
-    povm: POVMType,
+    observables: Union[qutip.Qobj, Sequence[qutip.Qobj]]
+) -> NDArray[np.float64]:
+    """Calculate the probabilities of measurement outcomes for a given set of states and a POVM."""
+    if isinstance(observables, qutip.Qobj):
+        observables = [observables]    
+    if isinstance(states, qutip.Qobj):
+        states = [states]
+    
+    expvals = np.array(
+        [qutip.expect(obs, states).real for obs in observables]
+    ).T  # shape (n_states, n_povm_outcomes)
+    
+    return expvals
+
+def expvals_from_kets_and_observables_numpy(
+    kets: NDArray[np.complex128],
+    observables: NDArray[np.complex128]
+) -> NDArray[np.float64]:
+    """
+    Calculate the expectation values for a given set of kets and observables, using numpy.
+
+    Everything is taken to be a numpy array here.
+    kets is a 2D array where each row is a ket (shape: n_kets x dim),
+    and observables is a 3D array of observables (shape: n_observables x dim x dim).
+
+    Returns a 2D array of expectation values (shape: n_observables x n_kets).
+    """
+    if kets.ndim == 1:
+        # If kets is a 1D array, we assume it's a single ket
+        kets = kets[None, :]
+    elif kets.ndim != 2:
+        raise ValueError("kets must be a 2D array (shape: n_kets x dim). (at least for now)")
+    
+    expvals = np.einsum('ni,kij,nj->kn',
+        kets.conj(),
+        observables,
+        kets,
+        optimize=True
+    ).real
+    # shape (n_observables, n_kets)    
+    return expvals
+
+def expvals_from_dms_and_observables_numpy(
+    dms: NDArray[np.complex128],
+    observables: NDArray[np.complex128]
+) -> NDArray[np.float64]:
+    """
+    Calculate the expectation values for a given set of density matrices and observables, using numpy.
+
+    dms is a 3D array (shape: n_dms x dim x dim),
+    and observables is a 3D array (shape: n_observables x dim x dim).
+
+    Returns a 2D array of expectation values (shape: n_observables x n_dms).
+    """
+    if dms.ndim == 2:
+        # If dms is a 2D array, we assume it's a single density matrix
+        dms = dms[None, :, :]
+    elif dms.ndim != 3 or dms.shape[1] != dms.shape[2]:
+        raise ValueError("dms must be a 3D array (shape: n_dms x dim x dim).")
+    if observables.ndim != 3 or observables.shape[1] != observables.shape[2]:
+        raise ValueError("observables must be a 3D array (shape: n_observables x dim x dim).")
+    
+    expvals = np.einsum('nij,kij->kn',
+        dms,
+        observables.conj(),
+        optimize=True
+    ).real
+    # shape (n_observables, n_dms)
+    return expvals
+
+
+def sample_from_probabilities(
+    probabilities: NDArray[np.float64],
+    statistics: float,
+    return_frequencies: bool = True,
+    sampling_method: SamplingMethodType = 'standard'
+) -> NDArray:
+    """Sample outcomes from a given set of probabilities.
+    
+    Parameters
+    ----------
+    probabilities : NDArray[np.float64]
+        A 2D array of shape (n_states, num_outcomes) containing the probabilities for each outcome.
+    statistics : float
+        Number of measurement shots PER STATE. Use np.inf for exact probabilities.
+        Finite non-integer values will raise an error.
+    return_frequencies : bool, optional
+        - If True: Return measurement frequencies for each state.
+          Shape: (n_states, n_outcomes).
+        - If False (default) and sampling_method='standard': Return raw sampled
+          outcome indices for each state. Shape: (n_states, statistics).
+        - If False and sampling_method='poisson': Raises ValueError.
+    sampling_method : SamplingMethodType, optional
+        - 'standard': Sample outcomes using multinomial distribution based on
+          exact probabilities for the requested number of shots (statistics).
+        - 'poisson': Sample counts for each outcome using a Poisson distribution
+          with mean = statistics * probability. Requires return_frequencies=True.
+        (default: 'standard').
+    """
+    if not isinstance(probabilities, np.ndarray):
+        raise TypeError("Probabilities must be a numpy.ndarray.")
+    if probabilities.ndim == 1:
+        # If probabilities is a 1D array, we assume it's for a single state
+        probabilities = probabilities.reshape(1, -1)
+    elif probabilities.ndim != 2:
+        raise ValueError(f"Probabilities must be a 2D array (shape: n_states x num_outcomes). Got {probabilities.ndim} dimensions.")
+    # Check statistics value (return probabilities if np.inf, round non-inf floats)
+    if np.isinf(statistics):
+        if not return_frequencies:
+             raise ValueError("Cannot return raw outcomes for infinite statistics. Set return_frequencies=True.")
+        logger.debug("Returning exact probabilities for infinite statistics.")
+        return probabilities  # Shape (num_probs, num_outcomes)
+    elif not isinstance(statistics, int):
+        raise ValueError(f"Statistics must be a positive integer or np.inf. You gave {statistics}.")
+
+    n_states = probabilities.shape[0]
+    num_outcomes = probabilities.shape[1]
+    if sampling_method == 'standard':
+        if return_frequencies:
+            # Calculate frequencies for each state
+            all_frequencies = np.zeros_like(probabilities, dtype=float)
+            for i in range(n_states):
+                sampled_outcomes = np.random.choice(
+                    a=num_outcomes, size=statistics, p=probabilities[i]
+                )
+                # Count occurrences of each outcome
+                counts = np.bincount(sampled_outcomes, minlength=num_outcomes)
+                all_frequencies[i, :] = counts / statistics
+            return all_frequencies # Shape (n_states, num_outcomes)
+        else:
+            # Return raw sampled outcomes for each state
+            all_sampled_outcomes = np.zeros((n_states, statistics), dtype=int)
+            for i in range(n_states):
+                all_sampled_outcomes[i, :] = np.random.choice(
+                    a=num_outcomes, size=statistics, p=probabilities[i]
+                )
+            return all_sampled_outcomes # Shape (n_states, statistics)
+    elif sampling_method == 'poisson':
+        if not return_frequencies:
+            raise ValueError("Cannot return raw outcomes when using Poisson sampling. Set return_frequencies=True.")
+
+        # Calculate expected counts (lambda for Poisson)
+        # Shape: (n_states, num_outcomes)
+        expected_counts = statistics * probabilities
+
+        # Sample from Poisson distribution
+        # Shape: (n_states, num_outcomes)
+        poisson_counts = np.random.poisson(lam=expected_counts)
+
+        # Calculate frequencies
+        # Avoid division by zero if statistics is 0 (although handled earlier, defensive check)
+        frequencies = poisson_counts / statistics
+        return frequencies # return shape (num_outcomes, n_states)
+
+    else:
+        raise ValueError(f"Unknown sampling method: '{sampling_method}'. Use 'standard' or 'poisson'.")
+
+
+
+def measure_povm_np(
+    states: ArrayLike,
+    povm: ArrayLike,
     statistics: float,
     return_frequencies: bool = False,
-    sampling_method: str = 'standard'
+    sampling_method: SamplingMethodType = 'standard'
 ) -> NDArray:
     """
     Simulates measuring a POVM on one or more quantum states.
+    This function operates on the raw numpy arrays. If you want fancies stuff use QuantumOperatorsBatch.measure_povm() etc instead.
 
     Parameters
     ----------
-    states : Union[qutip.Qobj, Sequence[qutip.Qobj]]
-        The quantum state(s) (density matrices) to be measured.
-    povm : POVMType
-        The POVM operators. Can be a sequence of operators or a POVM object.
+    states : ArrayLike
+        One or more quantum states.
+        If it's a 1D array, it is treated as a single ket state.
+        If it's a 2D array, each row is assumed to be a ket vector.
+        If it's a 3D array, each row is assumed to be a density matrix.
+    povm : ArrayLike
+        A POVM represented as a list of effects as a 3D array (shape: n_povm_outcomes x dim x dim).
     statistics : float
         Number of measurement shots PER STATE. Use np.inf for exact probabilities.
         Finite non-integer values will raise an error.
@@ -281,159 +828,57 @@ def measure_povm(
         Either the raw measurement outcomes or the outcome frequencies,
         depending on `return_frequencies` and `sampling_method`. See parameter
         descriptions for exact shapes.
-
-    Raises
-    ------
-    ValueError
-        If input parameters are invalid (e.g., non-integer finite statistics,
-        requesting raw outcomes with Poisson sampling, unknown sampling method).
-    TypeError
-        If states are not qutip.Qobj objects.
     """
-    # ensure povm is properly formatted, if it's not already a POVM object
-    if not isinstance(povm, POVM):
-        povm = POVM(povm)
-    num_outcomes = len(povm)
+    povm = np.asarray(povm, dtype=np.complex128)
+    if povm.ndim != 3 or povm.shape[1] != povm.shape[2]:
+        raise ValueError(f"POVM must be a 3D array (shape: n_povm_outcomes x dim x dim). Got {povm.ndim} dimensions.")
     
-    # Ensure states is a list
-    if isinstance(states, qutip.Qobj):
-        states = [states]
-    elif not isinstance(states, Sequence):
-         raise TypeError(f"states must be a qutip.Qobj or a Sequence of qutip.Qobj, got {type(states)}.")
-    if not states:
-        raise ValueError("States list cannot be empty.")
-    n_states = len(states)
+    states = np.asarray(states, dtype=np.complex128)
+    if states.ndim == 1:
+        # If states is a 1D array, we assume it's a single ket state
+        states = states.reshape(1, -1)
+    if states.ndim == 2:
+        # If states is a 2D array, we assume each row is a ket vector
+        probabilities = expvals_from_kets_and_observables_numpy(states, povm)
+    elif states.ndim == 3:
+        # If states is a 3D array, we assume each row is a density matrix
+        probabilities = expvals_from_dms_and_observables_numpy(states, povm)
+    else:
+        raise ValueError(f"States must be a 1D array (single ket), a 2D array (multiple kets), or a 3D array (density matrices). Got {states.ndim} dimensions.")
 
     # Check statistics value (return probabilities if np.inf, round non-inf floats)
-    n_shots: int
-    if np.isinf(statistics):
-        if not return_frequencies:
-             raise ValueError("Cannot return raw outcomes for infinite statistics. Set return_frequencies=True.")
-        n_shots = -1 # Placeholder, won't be used for sampling
+    return sample_from_probabilities(
+        probabilities.T,
+        statistics,
+        return_frequencies=return_frequencies,
+        sampling_method=sampling_method
+    ).T
+
+def measure_povm(
+    states: Union[QuantumState, QuantumStatesBatch, ArrayLike],
+    povm: Union[POVM, ArrayLike],
+    statistics: float,
+    return_frequencies: bool = False,
+    sampling_method: SamplingMethodType = 'standard'
+) -> NDArray:
+    """Measure a POVM on one or more quantum states.
+    
+    General interface that works with both QuantumStatesBatch and raw numpy arrays.
+    """
+    if isinstance(states, QuantumStatesBatch):
+        states_ = states.data
+    elif isinstance(states, QuantumState):
+        states_ = states.asbatch().data
     else:
-        n_shots = round(statistics)  # round down to the nearest integer
+        states_ = np.asarray(states, dtype=np.complex128)
 
-    logger.debug(f"Calculating exact probabilities for {n_states} states and {num_outcomes} POVM outcomes.")
-    probabilities = np.array(
-        [qutip.expect(cast(qutip.Qobj, effect), states).real for effect in povm]
-    ).T # shape (n_states, num_outcomes)
-
-    if np.isinf(statistics):
-        logger.debug("Returning exact probabilities for infinite statistics.")
-        return probabilities # Shape (num_outcomes, num_states)
-
-    #### =================== ACTUAL SAMPLING =================== ####
-    if sampling_method == 'standard':
-        if return_frequencies:
-            # Calculate frequencies for each state
-            all_frequencies = np.zeros((num_outcomes, n_states), dtype=float)
-            for i in range(n_states):
-                sampled_outcomes = np.random.choice(
-                    a=num_outcomes, size=n_shots, p=probabilities[i]
-                )
-                # Count occurrences of each outcome
-                counts = np.bincount(sampled_outcomes, minlength=num_outcomes)
-                all_frequencies[:, i] = counts / n_shots
-            return all_frequencies # Shape (num_outcomes, n_states)
-        else:
-            # Return raw sampled outcomes for each state
-            all_sampled_outcomes = np.zeros((n_states, n_shots), dtype=int)
-            for i in range(n_states):
-                all_sampled_outcomes[i, :] = np.random.choice(
-                    a=num_outcomes, size=n_shots, p=probabilities[i]
-                )
-            return all_sampled_outcomes # Shape (n_states, n_shots)
-    elif sampling_method == 'poisson':
-        if not return_frequencies:
-            raise ValueError("Cannot return raw outcomes when using Poisson sampling. Set return_frequencies=True.")
-
-        # Calculate expected counts (lambda for Poisson)
-        # Shape: (n_states, num_outcomes)
-        expected_counts = n_shots * probabilities
-
-        # Sample from Poisson distribution
-        # Shape: (n_states, num_outcomes)
-        poisson_counts = np.random.poisson(lam=expected_counts)
-
-        # Calculate frequencies
-        # Avoid division by zero if n_shots is 0 (although handled earlier, defensive check)
-        frequencies = poisson_counts / n_shots
-        return frequencies.T # return shape (num_outcomes, n_states)
-
+    if isinstance(povm, POVM):
+        povm_ = povm.data
     else:
-        raise ValueError(f"Unknown sampling method: '{sampling_method}'. Use 'standard' or 'poisson'.")
+        povm_ = np.asarray(povm, dtype=np.complex128)
+    # do the thing
+    return measure_povm_np(states_, povm_, statistics, return_frequencies, sampling_method)
 
-
-# define a function that returns the single-qubit SIC-POVM
-def sic_povm() -> POVM:
-    """
-    Get the single-qubit SIC-POVM.
-
-    Returns:
-    --------
-    POVM
-        A POVM object containing the SIC-POVM operators with associated label.
-    """
-    # Define the SIC-POVM operators for a single qubit
-    povm = [
-        qutip.Qobj([[1, 0], [0, 0]]) / 2,
-        qutip.ket2dm(qutip.Qobj([1/np.sqrt(3), np.sqrt(2/3)])) / 2,
-        qutip.ket2dm(qutip.Qobj([1/np.sqrt(3), np.sqrt(2/3) * np.exp(2 * np.pi * 1j / 3)])) / 2,
-        qutip.ket2dm(qutip.Qobj([1/np.sqrt(3), np.sqrt(2/3) * np.exp(4 * np.pi * 1j / 3)])) / 2
-    ]
-    return POVM(povm, label="SIC")
-
-# extract the projections over the eigenstates of the three Pauli matrices
-def mub_povm() -> POVM:
-    """
-    Generate a single-qubit POVM consisting of the projections over the eigenstates of the three Pauli matrices.
-    The resulting POVM is a list of 6 rank-1 projectors.
-    """
-    ops = [
-        qutip.ket2dm(qutip.basis(2, 0)), # |0><0|
-        qutip.ket2dm(qutip.basis(2, 1)), # |1><1|
-        qutip.ket2dm(qutip.basis(2, 0) + qutip.basis(2, 1)) / 2,
-        qutip.ket2dm(qutip.basis(2, 0) - qutip.basis(2, 1)) / 2,
-        qutip.ket2dm(qutip.basis(2, 0) + 1j * qutip.basis(2, 1)) / 2,
-        qutip.ket2dm(qutip.basis(2, 0) - 1j * qutip.basis(2, 1)) / 2
-    ]
-    normalized_povm = [op / 3 for op in ops]
-    return POVM(normalized_povm, label="MUB")
-
-def random_rank1_povm(dim: int, num_outcomes: int, seed: Optional[bool] = None) -> POVM:
-    """
-    Generate a random rank-1 POVM with d outcomes in a d-dimensional Hilbert space.
-    The returned list [E_1, ..., E_d] satisfies sum_i E_i = I_d, 
-    and each E_i is a rank-1 projector.
-    
-    Parameters
-    ----------
-    d : int
-        Dimension of the Hilbert space.
-    num_outcomes : int
-    seed : int, optional
-        Seed for reproducible random generation.
-    
-    Returns
-    -------
-    povm : list of ndarray
-        A list [E_1, ..., E_d] of d rank-1 projectors,
-        each a d x d complex ndarray.
-    """
-
-    if seed is not None:
-        np.random.seed(seed)
-    
-    random_unitary = qutip.rand_unitary(num_outcomes).full()[:, :dim]
-    
-    # Build POVM elements as rank-1 projectors onto the columns of U
-    povm = []
-    for i in range(num_outcomes):
-        col = random_unitary[i]
-        E_i = np.outer(col, col.conjugate())
-        povm.append(qutip.Qobj(E_i))
-    
-    return POVM(povm, label="Random rank-1, {} outcomes".format(num_outcomes))
 
 def get_permutation_operator(d: int, k: int, perm: tuple) -> np.ndarray:
     r"""

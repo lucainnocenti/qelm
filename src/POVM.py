@@ -15,70 +15,68 @@ import numpy as np
 from numpy.typing import NDArray
 import qutip
 
+from src.quantum_utils import POVM, ket2dm
 
-# class representing POVM (as a list of qutip.Qobj) and the associated label, for example, "SIC", "MUB", etc.
-class POVM:
+
+def sic_povm() -> POVM:
     """
-    Class representing a POVM.
+    Get the single-qubit SIC-POVM.
 
-    Accepts various input types for POVM elements (sequences of qutip.Qobj or numpy arrays),
-    but internally converts and stores them as a list of qutip.Qobj objects.
-    It also stores an associated label, useful for plotting or identification purposes.
-    
-    Attributes:
-        elements (List[qutip.Qobj]): A list of POVM elements as qutip.Qobj objects.
-        label (str): An optional label for the POVM.
-        num_outcomes (int): Number of outcomes. Inferred from the length of the POVM.
+    Returns:
+    --------
+    POVM
+        A POVM object containing the SIC-POVM operators with associated label.
     """
-    elements: List[qutip.Qobj]  # The actual stored type
-    label: str
-    num_outcomes: int
-    
-    def __init__(self, elements: POVMType, label: Optional[str] = None):
-        """
-        Initialize a POVM with the given elements.
+    # Define the SIC-POVM operators for a single qubit
+    povm = [
+        np.array([[1, 0], [0, 0]]) / 2,
+        ket2dm([1/np.sqrt(3), np.sqrt(2/3)]) / 2,
+        ket2dm([1/np.sqrt(3), np.sqrt(2/3) * np.exp(2 * np.pi * 1j / 3)]) / 2,
+        ket2dm([1/np.sqrt(3), np.sqrt(2/3) * np.exp(4 * np.pi * 1j / 3)]) / 2
+    ]
+    return POVM(povm, label="SIC")
 
-        Parameters:
-            elements (POVMType): Input POVM elements, which can be:
-                - A sequence of qutip.Qobj objects
-                - A sequence of numpy.ndarray objects (will be converted to qutip.Qobj)
-                - Another POVM object
-            label (Optional[str], optional): A label for the POVM. Defaults to a generated label.
+def mub_povm() -> POVM:
+    """
+    Generate a single-qubit POVM consisting of the projections over the eigenstates of the three Pauli matrices.
+    The resulting POVM is a list of 6 rank-1 projectors.
+    """
+    ops = [
+        ket2dm([1, 0]),
+        ket2dm([0, 1]),
+        ket2dm([1, 1]) / 2,
+        ket2dm([1, -1]) / 2,
+        ket2dm([1, 1j]) / 2,
+        ket2dm([1, -1j]) / 2
+    ]
+    normalized_povm = [op / 3 for op in ops]
+    return POVM(normalized_povm, label="MUB")
 
-        Note:
-            Although the input can be of various types, after initialization `self.elements` 
-            will always be a list of qutip.Qobj objects.
-        
-        Raises:
-            ValueError: If any element is neither a qutip.Qobj nor a numpy.ndarray.
-        """
-        # Generate default label if none provided
-        self.num_outcomes = len(elements)
-        if label is None:
-            label = f"unknown, {len(elements)} outcomes"
-        
-        # Process the POVM elements
-        processed_povm = []
-        for op in elements:
-            if not isinstance(op, (qutip.Qobj, np.ndarray)):
-                raise ValueError("POVM elements must be qutip.Qobj or numpy.ndarray.")
-            if isinstance(op, np.ndarray):
-                op = qutip.Qobj(op)
-            processed_povm.append(op)
-        
-        self.elements = processed_povm
-        self.label = label
+def random_rank1_povm(dim: int, num_outcomes: int, seed: Optional[bool] = None) -> POVM:
+    """
+    Generate a random rank-1 POVM with d outcomes in a d-dimensional Hilbert space.
+    The returned list [E_1, ..., E_d] satisfies sum_i E_i = I_d, 
+    and each E_i is a rank-1 projector.
     
-    def __iter__(self):
-        return iter(self.elements)
+    Parameters
+    ----------
+    d : int
+        Dimension of the Hilbert space.
+    num_outcomes : int
+    seed : int, optional
+        Seed for reproducible random generation.
     
-    def __len__(self):
-        return len(self.elements)
-    
-    def __getitem__(self, index):
-        return self.elements[index]
+    Returns
+    -------
+    povm : list of ndarray
+        A list [E_1, ..., E_d] of d rank-1 projectors,
+        each a d x d complex ndarray.
+    """
 
+    if seed is not None:
+        np.random.seed(seed)
+    
+    random_unitary = qutip.rand_unitary(num_outcomes).full()[:, :dim]
+    povm = [np.outer(row, row.conj()) for row in random_unitary]
 
-# --- Type Definitions ---
-POVMElement = Union[qutip.Qobj, NDArray[np.complex128]]
-POVMType = Union[Sequence[POVMElement], POVM]  # Allow sequences or the POVM class
+    return POVM(povm, label="Random rank-1, {} outcomes".format(num_outcomes))
