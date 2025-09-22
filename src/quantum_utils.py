@@ -6,7 +6,7 @@ logger = logging.getLogger(__name__)
 import qutip
 import numpy as np
 
-# --- Type Hinting Setup ---
+import numbers
 from numpy.typing import NDArray, ArrayLike
 import typing
 from typing import List, Union, Iterable, Optional, Literal, Sequence, cast, ClassVar
@@ -206,7 +206,7 @@ class QuantumState:
 
     def measure_povm(self, povm: POVM, statistics: float,
                      sampling_method: SamplingMethodType = 'standard',
-                     return_frequencies: bool = False) -> NDArray:
+                     return_frequencies: bool = True) -> NDArray:
         return self.asbatch().measure_povm(
             povm=povm,
             statistics=statistics,
@@ -221,7 +221,11 @@ class QuantumKet(QuantumState):
     def __init__(self, vec: NDArray | Sequence[complex]):
         data = np.asarray(vec, dtype=np.complex128)
         if data.ndim != 1:
-            raise ValueError("Input vector must be 1D (a ket).")
+            if data.ndim == 2 and (data.shape[1] == 1 or data.shape[0] == 1):
+                # if it's a 2D array with one column or one row, we can treat it as a 1D vector
+                data = data.flatten()
+            else:
+                raise ValueError("Input vector must be 1D (a ket).")
         self.data = data
         self.dim: int = data.shape[0]
 
@@ -295,7 +299,7 @@ class QuantumStatesBatch:
     
     def measure_povm(self, povm: POVM, statistics: float, 
                      sampling_method: SamplingMethodType = 'standard',
-                     return_frequencies: bool = False) -> NDArray:
+                     return_frequencies: bool = True) -> NDArray:
         raise NotImplementedError("Subclasses must implement this method.")
     
     def expvals(self, observables: ObservablesType) -> NDArray[np.float64]:
@@ -325,7 +329,7 @@ class QuantumKetsBatch(QuantumStatesBatch):
     
     def measure_povm(self, povm: POVM, statistics: float,
                      sampling_method: SamplingMethodType = 'standard',
-                     return_frequencies: bool = False) -> NDArray:
+                     return_frequencies: bool = True) -> NDArray:
         """Measure a POVM on each ket in the batch, with some given statistics.
         
         Parameters:
@@ -389,7 +393,7 @@ class QuantumDensityMatricesBatch(QuantumOperatorsBatch, QuantumStatesBatch):
     
     def measure_povm(self, povm: POVM, statistics: float,
                      sampling_method: SamplingMethodType = 'standard',
-                     return_frequencies: bool = False) -> NDArray:
+                     return_frequencies: bool = True) -> NDArray:
         """Measure a POVM on each density matrix in the batch, with the specified statistics.
         
         Parameters:
@@ -739,7 +743,7 @@ def sample_from_probabilities(
              raise ValueError("Cannot return raw outcomes for infinite statistics. Set return_frequencies=True.")
         logger.debug("Returning exact probabilities for infinite statistics.")
         return probabilities  # Shape (num_probs, num_outcomes)
-    elif not isinstance(statistics, int):
+    elif not isinstance(statistics, numbers.Integral):
         raise ValueError(f"Statistics must be a positive integer or np.inf. You gave {statistics}.")
 
     n_states = probabilities.shape[0]
@@ -790,7 +794,7 @@ def measure_povm_np(
     states: ArrayLike,
     povm: ArrayLike,
     statistics: float,
-    return_frequencies: bool = False,
+    return_frequencies: bool = True,
     sampling_method: SamplingMethodType = 'standard'
 ) -> NDArray:
     """
@@ -858,7 +862,7 @@ def measure_povm(
     states: Union[QuantumState, QuantumStatesBatch, ArrayLike],
     povm: Union[POVM, ArrayLike],
     statistics: float,
-    return_frequencies: bool = False,
+    return_frequencies: bool = True,
     sampling_method: SamplingMethodType = 'standard'
 ) -> NDArray:
     """Measure a POVM on one or more quantum states.

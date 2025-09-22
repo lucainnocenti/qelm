@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from numpy.typing import NDArray
 
@@ -30,3 +31,15 @@ def pp_matrix(matrix):
     # pretty print a matrix using sympy
     import sympy
     return sympy.latex(sympy.Matrix(matrix))
+
+
+def ensure_unique_filename(path):
+    """Generate a unique file path by appending a counter to the filename if it already exists."""
+    filename, extension = os.path.splitext(path)
+    counter = 1
+
+    while os.path.exists(path):
+        path = filename + " (" + str(counter) + ")" + extension
+        counter += 1
+
+    return path

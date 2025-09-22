@@ -9,9 +9,8 @@ from typing import ClassVar, Iterable, List, Literal, Optional, Sequence, Union
 import numpy as np
 import qutip
 
-from src.POVM import POVM
+from src.quantum_utils import POVM, QuantumState, QuantumDensityMatrix
 from src.types import BasisType, RescalingInput
-# from src.quantum_utils import QuantumState    
 
 def frame_operator(
     povm: POVM,
@@ -37,13 +36,13 @@ def frame_operator(
     """
     # 1) Extract the list of Qobj elements and check non-empty
     # elems = povm.elements
-    if not povm.elements:
+    if not povm.data:
         raise ValueError("POVM must contain at least one element.")
 
     # 2) Figure out the dimension `d` and the vector dimension `d²`
-    d = QuantumState(povm.elements[0]).dimension
+    d = povm.data.shape[0]
     vec_dim = d * d
-    n_outcomes = len(povm.elements)  # number of POVM outcomes
+    n_outcomes = len(povm.data)  # number of POVM outcomes
 
     # 3) Compute rescaling factors α_b
     if isinstance(rescaling, list):
@@ -54,7 +53,7 @@ def frame_operator(
 
     elif rescaling == "trace":
         # α_b = Tr(E_b)/d  (use real part of the trace)
-        alpha = np.array([E.full().trace().real for E in povm.elements]) / d
+        alpha = np.array([E.full().trace().real for E in povm.data]) / d
 
     elif rescaling == "none":
         # α_b = 1 for all b
@@ -67,7 +66,7 @@ def frame_operator(
     #    We allocate a complex buffer and let QuantumState.vectorise
     #    cast to real if needed.
     V = np.empty((vec_dim, n_outcomes), dtype=complex)
-    for i, E in enumerate(povm.elements):
+    for i, E in enumerate(povm.data):
         V[:, i] = QuantumState(E).vectorise(basis=basis)
 
     # 6) Build the frame operator F = ∑ α_b² · v_b·v_b†
@@ -94,11 +93,11 @@ def shadow_estimator(
 
     Returns a list of NumPy arrays for the dual POVM elements.
     """
-    if not povm.elements:
+    if not povm.data:
         raise ValueError("POVM must contain at least one element.")
 
-    d = QuantumState(povm.elements[0]).dimension
-    n_outcomes = len(povm.elements)
+    d = povm.data.shape[0]  # dimension of the POVM elements
+    n_outcomes = len(povm.data)
 
     # 1) Compute frame operator F and its pseudo-inverse F⁻¹
     F     = frame_operator(povm, basis=basis, rescaling=rescaling)
@@ -108,7 +107,7 @@ def shadow_estimator(
     if isinstance(rescaling, list):
         alpha = np.array(rescaling, dtype=float)
     elif rescaling == "trace":
-        alpha = np.array([E.full().trace().real for E in povm.elements]) / d
+        alpha = np.array([E.full().trace().real for E in povm.data]) / d
     elif rescaling == "none":
         alpha = np.ones(n_outcomes, dtype=float)
     else:
@@ -117,7 +116,7 @@ def shadow_estimator(
 
     # 4) Vectorise original POVM into V (d²×k)
     V = np.empty((d*d, n_outcomes), dtype=complex)
-    for i, E in enumerate(povm.elements):
+    for i, E in enumerate(povm.data):
         V[:, i] = QuantumState(E).vectorise(basis=basis)
 
     # 5) Compute dual vectors W[:,b] = F⁻¹ [ α_b² · V[:,b] ]
@@ -128,11 +127,7 @@ def shadow_estimator(
     # 6) Un-vectorise each dual vector back into a d×d matrix
     duals: List[np.ndarray] = []
     for b in range(n_outcomes):
-        qs = QuantumState.from_vector(
-            W[:, b],
-            dimension=d,
-            basis=basis
-        )
-        duals.append(qs.matrix)
+        qs = QuantumDensityMatrix.from_vector(W[:, b], basis=basis)
+        duals.append(qs.data)
 
     return duals
