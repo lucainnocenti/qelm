@@ -628,6 +628,25 @@ def random_kets(dim: int, num_kets: int, seed: Optional[int] = None) -> NDArray[
 
     return haar_states
 
+def random_density_matrices(n: int, dim: int, seed=None, dtype=np.complex128) -> NDArray[np.complex128]:
+    """
+    Generate n random dxd density matrices from the Hilbert–Schmidt ensemble.
+
+    Returns: array of shape (n, d, d), complex Hermitian PSD, trace 1.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Complex Ginibre: entries ~ N(0,1) + i N(0,1)
+    G = rng.standard_normal((n, dim, dim)) + 1j * rng.standard_normal((n, dim, dim))
+    G = G.astype(dtype, copy=False)
+
+    # X = G G†  (batched)
+    X = G @ np.conjugate(np.swapaxes(G, -1, -2))
+
+    # Normalize by trace (batched)
+    tr = np.real(np.trace(X, axis1=-2, axis2=-1))  # shape (n,)
+    rho = X / tr[:, None, None]
+    return rho
 
 def expvals_from_states_and_observables_qutip(
     states: Union[qutip.Qobj, Sequence[qutip.Qobj]],
@@ -744,20 +763,18 @@ def sample_from_probabilities(
         logger.debug("Returning exact probabilities for infinite statistics.")
         return probabilities  # Shape (num_probs, num_outcomes)
     elif not isinstance(statistics, numbers.Integral):
+        statistics = int(statistics)
         raise ValueError(f"Statistics must be a positive integer or np.inf. You gave {statistics}.")
 
     n_states = probabilities.shape[0]
     num_outcomes = probabilities.shape[1]
     if sampling_method == 'standard':
         if return_frequencies:
+            statistics = int(statistics)
             # Calculate frequencies for each state
             all_frequencies = np.zeros_like(probabilities, dtype=float)
             for i in range(n_states):
-                sampled_outcomes = np.random.choice(
-                    a=num_outcomes, size=statistics, p=probabilities[i]
-                )
-                # Count occurrences of each outcome
-                counts = np.bincount(sampled_outcomes, minlength=num_outcomes)
+                counts = np.random.multinomial(n=statistics, pvals=probabilities[i])
                 all_frequencies[i, :] = counts / statistics
             return all_frequencies # Shape (n_states, num_outcomes)
         else:

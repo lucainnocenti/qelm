@@ -43,3 +43,38 @@ def ensure_unique_filename(path):
         counter += 1
 
     return path
+
+
+def counts_to_frequencies(counts, n_qubits, shots=None, little_endian=True):
+    """
+    Convert Qiskit counts dict to a normalized frequency vector.
+
+    Parameters
+    ----------
+    counts : dict
+        Dictionary from Qiskit result.get_counts(), mapping bitstring->count.
+    n_qubits : int
+        Total number of qubits measured.
+    shots : int or None
+        Total number of shots. If None, sum(counts.values()) is used.
+    little_endian : bool
+        If True, interpret rightmost bit as qubit 0 (Qiskit default).
+        If False, interpret leftmost bit as qubit 0.
+
+    Returns
+    -------
+    freqs : np.ndarray
+        Array of shape (2**n_qubits,) with normalized frequencies.
+    """
+    if shots is None:
+        shots = sum(counts.values())
+
+    # freqs will hold the normalized frequencies for all possible 2**n_qubits bitstrings of length n_qubits
+    freqs = np.zeros(2**n_qubits, dtype=float)
+
+    # cycle through the counts dict and fill in the frequencies
+    for bitstring, c in counts.items():
+        index = int(bitstring[::-1], 2) if little_endian else int(bitstring, 2)
+        freqs[index] = c / shots
+
+    return freqs

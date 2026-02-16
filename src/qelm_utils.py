@@ -91,10 +91,10 @@ def exact_average_estimator_variance(estimator: Sequence[float], povm: POVM) -> 
     povm_np = povm.data
     estimator_np = np.asarray(estimator, dtype=np.float64) # Ensure numpy array
 
-    if not povm_np:
+    if povm_np is None or len(povm_np) == 0:
         raise ValueError("POVM list cannot be empty.")
     if len(estimator_np) != len(povm_np):
-         raise ValueError("Estimator length must match the number of POVM elements.")
+         raise ValueError(f"Estimator length must match the number of POVM elements. Got estimator length: {len(estimator_np)}, POVM length: {len(povm_np)}.")
 
     dim = povm_np[0].shape[0]
     num_outcomes = len(povm_np)
@@ -164,12 +164,12 @@ def exact_average_bias2(
     obs_np = target_observable.data
     estimator_np = np.asarray(estimator, dtype=np.float64)
 
-    if not povm_np:
+    if povm_np is None or len(povm_np) == 0:
         raise ValueError("POVM list cannot be empty.")
     if len(estimator_np) != len(povm_np):
-        raise ValueError("Estimator length must match the number of POVM elements.")
+        raise ValueError(f"Estimator length must match the number of POVM elements. Got estimator length: {len(estimator_np)}, POVM length: {len(povm_np)}.")
     if obs_np.shape != povm_np[0].shape:
-        raise ValueError("Observable dimensions must match POVM element dimensions.")
+        raise ValueError(f"Observable dimensions must match POVM element dimensions. Got observable shape: {obs_np.shape}, POVM element shape: {povm_np[0].shape}.")
 
 
     dim = povm_np[0].shape[0]
