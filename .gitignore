@@ -75,3 +75,5 @@ dmypy.json
 
 # Jupyter Notebook
 .ipynb_checkpoints/
+# results data lives in the OneDrive project folder; data/ is a local symlink to it
+/data
